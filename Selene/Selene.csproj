@@ -1,0 +1,32 @@
+<Project Sdk="Dalamud.NET.Sdk/15.0.0">
+
+  <PropertyGroup>
+    <AssemblyName>Selene</AssemblyName>
+    <RootNamespace>Selene</RootNamespace>
+    <Version>0.1.0</Version>
+    <DalamudLibPath>$(AppData)\XIVLauncher\addon\Hooks\dev\</DalamudLibPath>
+  </PropertyGroup>
+
+  <!-- Allow the test assembly to access internal types -->
+  <ItemGroup>
+    <AssemblyAttribute Include="System.Runtime.CompilerServices.InternalsVisibleToAttribute">
+      <_Parameter1>Selene.Tests</_Parameter1>
+    </AssemblyAttribute>
+  </ItemGroup>
+
+  <!--
+    Dev-plugin reload race (same fix as Charon.csproj and Hephaestus.csproj): Dalamud watches the
+    DLL and reloads the moment it changes, then reads Selene.json alongside it. The compiler writes
+    the DLL FIRST and DalamudPackager writes the manifest several seconds later, so the reload can
+    read a manifest that is still open and fail. Touching the DLL after the manifest is written
+    makes the DLL the LAST file to change.
+
+    Must hook the PACKAGER's targets, not "Build": SDK targets run after project-defined ones, so
+    AfterTargets="Build" here would still fire before the manifest was written.
+  -->
+  <Target Name="TouchAssemblyAfterPackaging"
+          AfterTargets="DefaultDalamudPackagerDebug;DefaultDalamudPackagerRelease">
+    <Touch Files="$(TargetPath)" />
+  </Target>
+
+</Project>

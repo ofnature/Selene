@@ -1,0 +1,9 @@
+{
+  "Name": "Selene",
+  "Author": "ofnature",
+  "Punchline": "Cosmic Exploration, at a person's pace.",
+  "Description": "Runs Cosmic Exploration missions in sessions that look like a person's: bursts of work, breaks, varied routes and spots. Hephaestus makes the crafts. Multibox-first.",
+  "RepoUrl": "https://github.com/ofnature/Selene",
+  "Tags": ["cosmic exploration", "automation", "multibox"],
+  "DalamudApiLevel": 15
+}
