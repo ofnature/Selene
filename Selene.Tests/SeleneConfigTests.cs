@@ -11,6 +11,19 @@ public class SeleneConfigTests
         Assert.False(config.Migrate());
     }
 
+    /// <summary>Multibox: one config for every client of a launcher, so a character's picks are its own.</summary>
+    [Fact]
+    public void EachCharacter_HasItsOwnSettings_MadeOnFirstUse()
+    {
+        var config = new SeleneConfig();
+
+        config.For(1).PickedMissions.Add(1395);
+
+        Assert.Equal(new uint[] { 1395 }, config.For(1).PickedMissions);
+        Assert.Empty(config.For(2).PickedMissions);
+        Assert.Equal(2, config.Characters.Count);
+    }
+
     [Fact]
     public void AnOlderConfig_IsBroughtUpToDate_Once()
     {

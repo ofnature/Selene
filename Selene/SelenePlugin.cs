@@ -1,11 +1,14 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using Dalamud.Game.Command;
 using Dalamud.Interface.Windowing;
 using Dalamud.Plugin;
 using Dalamud.Plugin.Services;
 using Selene.Features.Characters;
+using Selene.Features.Missions;
 using Selene.Features.Schedule;
+using Selene.Services;
 using Selene.Services.Game;
 using Selene.Windows;
 using Selene.Windows.Dock;
@@ -38,6 +41,15 @@ public sealed class SelenePlugin : IDalamudPlugin
     private readonly SeleneConfig _config;
     private readonly CharacterReader _character;
     private readonly CharacterRoster _roster;
+    private readonly MissionCatalog _catalog;
+    private readonly MissionReader _missionReader = new();
+    private readonly MissionWindows _missionWindows;
+    private readonly MissionRun _run = new();
+    private readonly HephaestusClient _hephaestus;
+
+    /// <summary>Run and Stop are pressed in the window; the tick acts on them, with a fresh look at the game.</summary>
+    private bool _runRequested;
+    private bool _stopRequested;
 
     /// <summary>The same for every character until the settings are per character (they are not in the config yet).</summary>
     private readonly ScheduleSettings _schedule = new();
@@ -50,6 +62,8 @@ public sealed class SelenePlugin : IDalamudPlugin
         ICommandManager commandManager,
         IFramework framework,
         IObjectTable objectTable,
+        IDataManager data,
+        IGameGui gameGui,
         IPluginLog log)
     {
         _pluginInterface = pluginInterface;
@@ -63,7 +77,13 @@ public sealed class SelenePlugin : IDalamudPlugin
         _character = new CharacterReader(objectTable);
         _roster = new CharacterRoster(pluginInterface.GetPluginConfigDirectory());
 
-        _mainWindow = new MainWindow(_config, SaveConfig);
+        _catalog = new MissionCatalog(data);
+        _hephaestus = new HephaestusClient(pluginInterface);
+        _missionWindows = new MissionWindows(gameGui);
+
+        _mainWindow = new MainWindow(_config, SaveConfig, PickMission,
+            startRun: () => { _runRequested = true; _nextTick = default; },
+            stopRun: () => { _stopRequested = true; _nextTick = default; });
 
         // The edge dock, as in Daedalus: one "Selene" tab, shown while a character is logged in, popping the
         // evening out beside it. The layout is shared with Daedalus's and Charon's tabs so none cover each
@@ -98,6 +118,11 @@ public sealed class SelenePlugin : IDalamudPlugin
 
     public void Dispose()
     {
+        // A run that is unloaded mid-craft (a plugin reload, a Debug build) would leave Hephaestus making
+        // items with nobody watching the clock: have it finish the one in hand and stop.
+        if (_run.Active)
+            _hephaestus.RequestStopAfterRun();
+
         _framework.Update -= OnFrameworkUpdate;
         _pluginInterface.UiBuilder.Draw -= Draw;
         _pluginInterface.UiBuilder.OpenMainUi -= ToggleMainWindow;
@@ -136,6 +161,27 @@ public sealed class SelenePlugin : IDalamudPlugin
         var contentId = _character.ContentId;
         _roster.Remember(contentId, _character.Name);
 
+        // Missions: READ ONLY. What the game says of the job the character is on, the picks, and Hephaestus.
+        var job = _character.ClassJobId;
+        var missionState = _missionReader.Read(job);
+        var picks = contentId != 0 && _config.Characters.TryGetValue(contentId, out var settings)
+            ? settings.PickedMissions
+            : (IReadOnlyCollection<uint>)Array.Empty<uint>();
+        var hephaestus = _hephaestus.Read();
+
+        // The attended run: the user has accepted the mission; Selene crafts, watches the clock and reports.
+        var observation = new RunObservation(missionState, hephaestus, _missionWindows.LogOpen);
+        if (_stopRequested)
+            Execute(_run.Stop(observation));
+        else if (_runRequested)
+            _run.Start(observation, picks, now);
+        _runRequested = _stopRequested = false;
+        Execute(_run.Tick(observation, now));
+
+        _mainWindow.Missions = new MissionView(
+            job, _catalog.JobName(job), missionState, MissionBoard.Build(_catalog.Missions, missionState, picks), hephaestus,
+            _run.Active, _run.Status);
+
         var rows = ScheduleBoard.Build(_roster.Names, contentId, _schedule, now);
         var mine = rows.FirstOrDefault(row => row.IsThisCharacter);
         _mainWindow.View = new ScheduleView(now, contentId != 0, _schedule, rows, new[]
@@ -143,7 +189,39 @@ public sealed class SelenePlugin : IDalamudPlugin
             ("Schedule", mine?.Decision.Status ?? "Idle — no character to schedule."),
             ("Character", _character.Status),
             ("Roster", _roster.Status),
+            ("Mission sheets", _catalog.Status),
+            ("Missions", _missionReader.Status),
+            ("Hephaestus", _hephaestus.Status),
+            ("Mission run", _run.Status),
+            ("Asked of Heph.", _hephaestus.LastAction),
+            ("Windows", _missionWindows.Status),
         });
+    }
+
+    /// <summary>The one thing the run asked for this tick. What came of it is read off the game next tick.</summary>
+    private void Execute(RunCommand command)
+    {
+        switch (command)
+        {
+            case RunCommand.StartCraft: _hephaestus.CraftSelected(MissionRun.CraftAmount); break;
+            case RunCommand.StopAfterItem: _hephaestus.RequestStopAfterRun(); break;
+            case RunCommand.Report: _missionWindows.Report(); break;
+        }
+    }
+
+    /// <summary>The user ticked or unticked a mission on the Missions page: kept for the logged-in character.</summary>
+    private void PickMission(uint missionId, bool picked)
+    {
+        var contentId = _character.ContentId;
+        if (contentId == 0)
+            return;
+
+        var picks = _config.For(contentId).PickedMissions;
+        picks.Remove(missionId);
+        if (picked)
+            picks.Add(missionId);
+        SaveConfig();
+        _nextTick = default; // show it at once
     }
 
     private void OnCommand(string command, string arguments) => ToggleMainWindow();

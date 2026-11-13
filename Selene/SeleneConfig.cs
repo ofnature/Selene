@@ -1,8 +1,20 @@
 using System;
+using System.Collections.Generic;
 using Dalamud.Configuration;
 using Selene.Windows.Dock;
 
 namespace Selene;
+
+/// <summary>One character's settings.</summary>
+[Serializable]
+public sealed class CharacterSettings
+{
+    /// <summary>
+    /// The missions the user ticked on the Missions page (WKSMissionUnit row ids): the only ones Selene
+    /// may ever accept. Picked by hand - Selene never adds to it.
+    /// </summary>
+    public List<uint> PickedMissions { get; set; } = new();
+}
 
 /// <summary>
 /// Root persistent configuration for Selene.
@@ -31,6 +43,21 @@ public sealed class SeleneConfig : IPluginConfiguration
 
     /// <summary>Where along its edge the tab sits: its centre as a fraction of the edge (0.5 = the middle).</summary>
     public float EdgeDockAlong { get; set; } = 0.5f;
+
+    /// <summary>
+    /// Per-character settings, keyed by content id (the suite's rule for a config every client of one
+    /// XIVLauncher shares). Two clients changing their own settings in the same minute can still lose one
+    /// change to the other's save - rare, and the same in every plugin of the suite.
+    /// </summary>
+    public Dictionary<ulong, CharacterSettings> Characters { get; set; } = new();
+
+    /// <summary>The character's settings, made on first use.</summary>
+    public CharacterSettings For(ulong contentId)
+    {
+        if (!Characters.TryGetValue(contentId, out var settings))
+            Characters[contentId] = settings = new CharacterSettings();
+        return settings;
+    }
 
     /// <summary>
     /// Bring a loaded config up to <see cref="CurrentVersion"/>. Returns true when something

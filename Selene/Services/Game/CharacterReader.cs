@@ -36,6 +36,9 @@ public sealed unsafe class CharacterReader
     /// <summary>The character's name; empty while there is no character in the world (a zone change too).</summary>
     public string Name => _objectTable.LocalPlayer?.Name.TextValue ?? string.Empty;
 
+    /// <summary>The job the character is on; 0 while there is no character in the world.</summary>
+    public uint ClassJobId => _objectTable.LocalPlayer?.ClassJob.RowId ?? 0;
+
     /// <summary>Who it sees, or why it sees nobody.</summary>
     public string Status
     {

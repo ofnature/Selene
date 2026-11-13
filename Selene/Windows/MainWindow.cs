@@ -8,6 +8,7 @@ using Dalamud.Interface;
 using Dalamud.Interface.Utility;
 using Dalamud.Interface.Utility.Raii;
 using Dalamud.Interface.Windowing;
+using Selene.Features.Missions;
 using Selene.Features.Schedule;
 using Selene.Windows.Components;
 using Selene.Windows.Dock;
@@ -24,6 +25,15 @@ namespace Selene.Windows;
 /// <param name="Status">Each service's Status line, for the Debug page.</param>
 public sealed record ScheduleView(
     DateTime Now, bool LoggedIn, ScheduleSettings Settings, IReadOnlyList<BoardRow> Rows, IReadOnlyList<(string Service, string Status)> Status);
+
+/// <summary>What the Missions page shows, made on the same tick.</summary>
+/// <param name="ClassJobId">The job the character is on; 0 = nobody in the world.</param>
+/// <param name="Rows">The job's Master missions: the sheets' and the game's, with the user's picks.</param>
+/// <param name="RunActive">A mission run is going.</param>
+/// <param name="RunStatus">What the run is doing, or why it is not.</param>
+public sealed record MissionView(
+    uint ClassJobId, string JobName, MissionState State, IReadOnlyList<MissionRow> Rows, HephaestusStatus Hephaestus,
+    bool RunActive, string RunStatus);
 
 public enum MainPage
 {
@@ -48,13 +58,22 @@ public sealed class MainWindow : Window
 
     private readonly SeleneConfig _config;
     private readonly Action _save;
+    private readonly Action<uint, bool> _pickMission;
+    private readonly Action _startRun;
+    private readonly Action _stopRun;
     private MainPage _page = MainPage.Overview;
 
-    public MainWindow(SeleneConfig config, Action save)
+    /// <param name="pickMission">The user ticked (true) or unticked a mission, by its id.</param>
+    /// <param name="startRun">The user pressed Run: finish the mission in progress.</param>
+    /// <param name="stopRun">The user pressed Stop.</param>
+    public MainWindow(SeleneConfig config, Action save, Action<uint, bool> pickMission, Action startRun, Action stopRun)
         : base("Selene##SeleneMain")
     {
         _config = config;
         _save = save;
+        _pickMission = pickMission;
+        _startRun = startRun;
+        _stopRun = stopRun;
 
         Size = new Vector2(860f, 640f);
         SizeCondition = ImGuiCond.FirstUseEver;
@@ -67,6 +86,9 @@ public sealed class MainWindow : Window
 
     /// <summary>Set by the plugin's tick; null until the first one.</summary>
     public ScheduleView? View { get; set; }
+
+    /// <summary>Set by the plugin's tick; null until the first one.</summary>
+    public MissionView? Missions { get; set; }
 
     /// <summary>The edge dock's own Status line, for the Debug page.</summary>
     public Func<string> DockStatus { get; set; } = () => "off";
@@ -102,10 +124,12 @@ public sealed class MainWindow : Window
             {
                 case MainPage.Overview: DrawOverview(view, mine); break;
                 case MainPage.Schedule: DrawSchedule(view); break;
-                case MainPage.Missions:
-                    DrawNotBuilt("Missions", "Which missions a burst runs.",
-                        "Decided: crafters only. The three Master missions of the current trade, picked by hand in a list here. No re-rolling. Accepted and reported through the game's own mission windows.");
-                    break;
+                // [SUPERSEDED 2026-11-12 by DrawMissions — the page reads the game and keeps the picks now]
+                // case MainPage.Missions:
+                //     DrawNotBuilt("Missions", "Which missions a burst runs.",
+                //         "Decided: crafters only. The three Master missions of the current trade, picked by hand in a list here. No re-rolling. Accepted and reported through the game's own mission windows.");
+                //     break;
+                case MainPage.Missions: DrawMissions(Missions); break;
                 case MainPage.Spots:
                     DrawNotBuilt("Spots", "Where a character stands to craft, and where it idles on a break.",
                         "Decided: you record a handful of spots a zone with a \"save this spot\" button here. Selene picks one a session with a small random offset, never the same one twice running.");
@@ -347,6 +371,172 @@ public sealed class MainWindow : Window
 
             ImGui.TableNextColumn();
             ScheduleBar.Draw(row.Plan, view.Now, ImGui.GetContentRegionAvail().X, 14f, hours: false);
+        }
+    }
+
+    // ---- missions ------------------------------------------------------------------------------
+
+    private void DrawMissions(MissionView? view)
+    {
+        SeleneTheme.PageHeader("Missions", "The Master missions of the job you are on. Tick the ones Selene may run.");
+        // [SUPERSEDED 2026-11-12 by the attended run — the page could only read then]
+        // SeleneTheme.TextWrapped(
+        //     "Nothing is accepted, crafted or reported yet. This page reads the game and keeps your picks for when it is.",
+        //     SeleneTheme.Amber);
+        SeleneTheme.TextWrapped(
+            "Selene does not accept missions yet. Accept a ticked mission yourself and open the Cosmic Crafting Log on its recipe, then press Run: Selene crafts through Hephaestus, has the item in hand finished before the clock runs out, and presses Report. Stay and watch - this has not been run before.",
+            SeleneTheme.Amber);
+        SeleneTheme.VSpace(2f);
+
+        if (view == null)
+        {
+            SeleneTheme.Text("Nothing has ticked yet.", SeleneTheme.TextSecondary);
+            return;
+        }
+
+        if (view.ClassJobId == 0)
+        {
+            SeleneTheme.Text("Log in to a character to see its missions.", SeleneTheme.TextSecondary);
+            return;
+        }
+
+        DrawMissionTiles(view);
+        SeleneTheme.VSpace(4f);
+        DrawRunControls(view);
+
+        if (!MissionInfo.IsCrafter(view.ClassJobId))
+        {
+            SeleneTheme.TextWrapped("Crafters only for now: change to a crafting job to see its Master missions.", SeleneTheme.TextSecondary);
+            return;
+        }
+
+        if (view.Rows.Count == 0)
+        {
+            SeleneTheme.TextWrapped("Neither the sheets nor the game name a Master mission for this job.", SeleneTheme.TextSecondary);
+            return;
+        }
+
+        SeleneTheme.SectionLabel($"Master missions · {view.JobName}");
+        SeleneTheme.VSpace(2f);
+        DrawMissionTable(view);
+
+        // The sheets' Master flag was checked once against the game; say so if the two ever part again.
+        if (view.State.InZone && view.Rows.Any(row => row.Offered && !row.Info.IsMaster))
+        {
+            SeleneTheme.TextWrapped(
+                "The game offers a mission here that the sheets do not mark as Master: Selene's reading of the sheets is out of date. The row's tooltip shows what it found.",
+                SeleneTheme.Rose);
+        }
+        else if (view.State.InZone && view.State.OfferedMaster.Count > 0 && view.Rows.Any(row => !row.Offered && row.Info.IsMaster))
+        {
+            SeleneTheme.TextWrapped(
+                "The sheets name a Master mission for this job that the game is not offering right now.",
+                SeleneTheme.TextMuted);
+        }
+    }
+
+    /// <summary>Run and Stop, and what the run says. A press is only a request: the plugin's tick acts on it.</summary>
+    private void DrawRunControls(MissionView view)
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+
+        ImGui.BeginDisabled(view.RunActive || !view.State.InMission);
+        if (ImGui.Button("Run this mission", new Vector2(150f * scale, 0f)))
+            _startRun();
+        ImGui.EndDisabled();
+        if (!view.RunActive && !view.State.InMission)
+            SeleneTheme.Tooltip("Accept a mission first.");
+
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!view.RunActive);
+        if (ImGui.Button("Stop", new Vector2(80f * scale, 0f)))
+            _stopRun();
+        ImGui.EndDisabled();
+        SeleneTheme.Tooltip("Ends the run. Hephaestus finishes the item in hand; the mission is left for you to report.");
+
+        ImGui.SameLine();
+        SeleneTheme.TextWrapped(view.RunStatus, view.RunActive ? SeleneTheme.StatusGreen : SeleneTheme.TextSecondary);
+        SeleneTheme.VSpace(4f);
+    }
+
+    private static void DrawMissionTiles(MissionView view)
+    {
+        var gap = 8f * ImGuiHelpers.GlobalScale;
+        var width = (ImGui.GetContentRegionAvail().X - (gap * 3f)) / 4f;
+        var state = view.State;
+        var hephaestus = view.Hephaestus;
+
+        StatTile.Draw("Job", view.JobName, state.InZone ? $"score {state.ClassScore:N0}" : null, SeleneTheme.Moon, width,
+            state.InZone ? "The job's Cosmic class score." : "Not in a Cosmic Exploration zone: the game is not saying anything about missions.");
+        ImGui.SameLine(0f, gap);
+        StatTile.Draw("In progress",
+            !state.InZone ? "Not in zone" : state.InMission ? state.Score.ToString("N0", CultureInfo.InvariantCulture) : "None",
+            !state.InMission ? null
+                : state.ClockSeconds is { } clock ? $"{state.Rank} · {clock / 60}:{clock % 60:00} left"
+                : $"{state.Rank} · no clock",
+            state.InMission ? SeleneTheme.StatusGreen : SeleneTheme.StatusGrey, width,
+            state.InMission ? $"Mission {state.CurrentMissionId}: its score, rank and clock, as the game has them." : null);
+        ImGui.SameLine(0f, gap);
+        StatTile.Draw("Hephaestus",
+            !hephaestus.Available ? "Not loaded" : hephaestus.Busy ? "Busy" : "Idle",
+            hephaestus.RunHalt != "None" ? hephaestus.RunHalt : null,
+            !hephaestus.Available ? SeleneTheme.Rose : hephaestus.Busy ? SeleneTheme.StatusGreen : SeleneTheme.Moon, width,
+            hephaestus.Status.Length > 0 ? hephaestus.Status : null);
+        ImGui.SameLine(0f, gap);
+        StatTile.Draw("Gear",
+            hephaestus.ReportsGear ? $"{hephaestus.GearConditionPercent}%" : "?",
+            hephaestus.ReportsGear ? $"gate {hephaestus.GearGatePercent}%" : "not reported",
+            hephaestus.GearFit ? SeleneTheme.StatusGreen : SeleneTheme.Rose, width,
+            hephaestus.ReportsGear
+                ? "The lowest condition of the gear on, and the line under which Hephaestus starts no synthesis. Selene will accept no mission under it."
+                : "This Hephaestus does not report its gear gate (the fields were added on 2026-11-12). Selene will accept no mission while it cannot tell.");
+    }
+
+    private void DrawMissionTable(MissionView view)
+    {
+        using var table = ImRaii.Table("##SeleneMissions", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV);
+        if (!table)
+            return;
+
+        var scale = ImGuiHelpers.GlobalScale;
+        ImGui.TableSetupColumn("Run", ImGuiTableColumnFlags.WidthFixed, 34f * scale);
+        ImGui.TableSetupColumn("Mission", ImGuiTableColumnFlags.WidthStretch);
+        ImGui.TableSetupColumn("Clock", ImGuiTableColumnFlags.WidthFixed, 50f * scale);
+        ImGui.TableSetupColumn("Silver / gold", ImGuiTableColumnFlags.WidthFixed, 110f * scale);
+        ImGui.TableSetupColumn("On the board", ImGuiTableColumnFlags.WidthFixed, 100f * scale);
+        ImGui.TableHeadersRow();
+
+        foreach (var row in view.Rows)
+        {
+            var info = row.Info;
+            ImGui.TableNextRow();
+
+            ImGui.TableNextColumn();
+            var picked = row.Picked;
+            if (ImGui.Checkbox($"##pick{info.Id}", ref picked))
+                _pickMission(info.Id, picked);
+
+            ImGui.TableNextColumn();
+            SeleneTheme.Text(info.Name, row.Picked ? SeleneTheme.TextPrimary : SeleneTheme.TextSecondary);
+            SeleneTheme.Tooltip($"Mission {info.Id} · tier {info.LevelGroup}{(info.IsMaster ? " · Master" : " · not Master")} · recipes {(info.RecipeIds.Count == 0 ? "none" : string.Join(", ", info.RecipeIds))}");
+
+            ImGui.TableNextColumn();
+            SeleneTheme.Text(info.TimeLimitSeconds > 0 ? $"{info.TimeLimitSeconds / 60}:{info.TimeLimitSeconds % 60:00}" : "untimed", SeleneTheme.TextDim);
+
+            ImGui.TableNextColumn();
+            SeleneTheme.Text(
+                $"{info.SilverScore.ToString("N0", CultureInfo.InvariantCulture)} / {info.GoldScore.ToString("N0", CultureInfo.InvariantCulture)}",
+                SeleneTheme.TextDim);
+
+            ImGui.TableNextColumn();
+            if (!view.State.InZone)
+                SeleneTheme.Text("not in zone", SeleneTheme.TextMuted);
+            else if (row.Current)
+                SeleneTheme.Text("in progress", SeleneTheme.StatusGreen);
+            else if (row.Offered)
+                SeleneTheme.Text(row.Bonus ? "offered · bonus" : "offered", SeleneTheme.MoonSoft);
+            else
+                SeleneTheme.Text("not offered", SeleneTheme.TextMuted);
         }
     }
 
