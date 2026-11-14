@@ -169,8 +169,12 @@ public sealed class SelenePlugin : IDalamudPlugin
             : (IReadOnlyCollection<uint>)Array.Empty<uint>();
         var hephaestus = _hephaestus.Read();
 
-        // The attended run: the user has accepted the mission; Selene crafts, watches the clock and reports.
-        var observation = new RunObservation(missionState, hephaestus, _missionWindows.LogOpen);
+        // The attended run: Selene accepts a ticked mission (or takes over one accepted by hand), opens the
+        // log, crafts, watches the clock and reports.
+        var board = _missionWindows.ReadBoard();
+        var observation = new RunObservation(
+            missionState, hephaestus, _missionWindows.LogOpen, board.Open, board.Missions, board.Selected,
+            _missionWindows.ConfirmingMission());
         if (_stopRequested)
             Execute(_run.Stop(observation));
         else if (_runRequested)
@@ -195,6 +199,7 @@ public sealed class SelenePlugin : IDalamudPlugin
             ("Mission run", _run.Status),
             ("Asked of Heph.", _hephaestus.LastAction),
             ("Windows", _missionWindows.Status),
+            ("Confirmation", _missionWindows.ConfirmDetail),
         });
     }
 
@@ -203,6 +208,13 @@ public sealed class SelenePlugin : IDalamudPlugin
     {
         switch (command)
         {
+            case RunCommand.OpenBoard: _missionWindows.OpenBoard(); break;
+            case RunCommand.ShowMasteryTab: _missionWindows.ShowMasteryTab(); break;
+            case RunCommand.SelectMission: _missionWindows.Select(_run.MissionId); break;
+            case RunCommand.InitiateMission: _missionWindows.Initiate(_run.MissionId); break;
+            case RunCommand.ConfirmMission: _missionWindows.ConfirmMission(_run.MissionId); break;
+            case RunCommand.OpenLog: _missionWindows.OpenLog(); break;
+            case RunCommand.SelectRecipe: _missionWindows.SelectRecipe(); break;
             case RunCommand.StartCraft: _hephaestus.CraftSelected(MissionRun.CraftAmount); break;
             case RunCommand.StopAfterItem: _hephaestus.RequestStopAfterRun(); break;
             case RunCommand.Report: _missionWindows.Report(); break;

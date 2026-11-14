@@ -383,8 +383,12 @@ public sealed class MainWindow : Window
         // SeleneTheme.TextWrapped(
         //     "Nothing is accepted, crafted or reported yet. This page reads the game and keeps your picks for when it is.",
         //     SeleneTheme.Amber);
+        // [SUPERSEDED 2026-11-12 by Selene accepting the mission itself — the user accepted and opened the log then]
+        // SeleneTheme.TextWrapped(
+        //     "Selene does not accept missions yet. Accept a ticked mission yourself and open the Cosmic Crafting Log on its recipe, then press Run: Selene crafts through Hephaestus, has the item in hand finished before the clock runs out, and presses Report. Stay and watch - this has not been run before.",
+        //     SeleneTheme.Amber);
         SeleneTheme.TextWrapped(
-            "Selene does not accept missions yet. Accept a ticked mission yourself and open the Cosmic Crafting Log on its recipe, then press Run: Selene crafts through Hephaestus, has the item in hand finished before the clock runs out, and presses Report. Stay and watch - this has not been run before.",
+            "Run takes ONE mission from start to report: it accepts a ticked mission the game offers (the bonus one first), opens the Cosmic Crafting Log, crafts through Hephaestus, has the item in hand finished before the clock runs out, and presses Report. With a mission already in progress it carries on from there. Stay and watch: accepting and opening the log have not been run before.",
             SeleneTheme.Amber);
         SeleneTheme.VSpace(2f);
 
@@ -440,12 +444,20 @@ public sealed class MainWindow : Window
     {
         var scale = ImGuiHelpers.GlobalScale;
 
-        ImGui.BeginDisabled(view.RunActive || !view.State.InMission);
-        if (ImGui.Button("Run this mission", new Vector2(150f * scale, 0f)))
+        // [SUPERSEDED 2026-11-12 — Run needed a mission in progress then]
+        // ImGui.BeginDisabled(view.RunActive || !view.State.InMission);
+        // if (ImGui.Button("Run this mission", new Vector2(150f * scale, 0f)))
+        //     _startRun();
+        // ImGui.EndDisabled();
+        // if (!view.RunActive && !view.State.InMission)
+        //     SeleneTheme.Tooltip("Accept a mission first.");
+        var canAccept = view.Rows.Any(row => row.Picked && row.Offered);
+        ImGui.BeginDisabled(view.RunActive || (!view.State.InMission && !canAccept));
+        if (ImGui.Button(view.State.InMission ? "Run this mission" : "Run a ticked mission", new Vector2(170f * scale, 0f)))
             _startRun();
         ImGui.EndDisabled();
-        if (!view.RunActive && !view.State.InMission)
-            SeleneTheme.Tooltip("Accept a mission first.");
+        if (!view.RunActive && !view.State.InMission && !canAccept)
+            SeleneTheme.Tooltip("Tick a mission the game is offering first.");
 
         ImGui.SameLine();
         ImGui.BeginDisabled(!view.RunActive);

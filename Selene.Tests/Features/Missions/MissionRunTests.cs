@@ -12,8 +12,12 @@ public class MissionRunTests
 
     private DateTime _now = new(2026, 11, 12, 21, 0, 0);
 
-    private static RunObservation Obs(HephaestusStatus hephaestus, int? clock = 300, uint score = 0, uint mission = Mission, bool log = true, bool inZone = true)
-        => new(new MissionState(inZone, 1319, 8, mission, score, MissionRank.None, new uint[] { 1395, 1396, 1397 }, 0, 0, clock), hephaestus, log);
+    private static RunObservation Obs(
+        HephaestusStatus hephaestus, int? clock = 300, uint score = 0, uint mission = Mission, bool log = true, bool inZone = true,
+        uint[]? offered = null, uint bonus = 0, bool board = false, uint[]? rows = null, uint selected = 0)
+        => new(
+            new MissionState(inZone, 1319, 8, mission, score, MissionRank.None, offered ?? new uint[] { 1395, 1396, 1397 }, bonus, 0, clock),
+            hephaestus, log, board, rows, selected);
 
     private RunCommand Tick(MissionRun run, RunObservation obs, double seconds = 1)
     {
@@ -58,13 +62,12 @@ public class MissionRunTests
     public static TheoryData<string, string> Refusals => new()
     {
         { "zone", "not in a Cosmic Exploration zone" },
-        { "none", "accept a mission first" },
+        { "notoffered", "none of the missions you ticked is offered" },
         { "unpicked", "is not one you ticked" },
         { "absent", "Hephaestus is not loaded" },
         { "busy", "Hephaestus is busy" },
         { "oldbuild", "does not report its gear gate" },
         { "worn", "gear is at 12% (gate 20%)" },
-        { "nolog", "open the Cosmic Crafting Log" },
         { "noclock", "clock cannot be seen" },
         { "late", "only 100 s left" },
     };
@@ -77,13 +80,12 @@ public class MissionRunTests
         var obs = what switch
         {
             "zone" => Obs(Idle, inZone: false),
-            "none" => Obs(Idle, mission: 0),
+            "notoffered" => Obs(Idle, mission: 0, offered: new uint[] { 1397 }),
             "unpicked" => Obs(Idle, mission: 1397),
             "absent" => Obs(HephaestusStatus.Absent),
             "busy" => Obs(Busy),
             "oldbuild" => Obs(Idle with { GearConditionPercent = -1, GearGatePercent = -1 }),
             "worn" => Obs(Idle with { GearConditionPercent = 12 }),
-            "nolog" => Obs(Idle, log: false),
             "noclock" => Obs(Idle, clock: null),
             _ => Obs(Idle, clock: MissionRun.StopMarginSeconds),
         };
@@ -116,7 +118,7 @@ public class MissionRunTests
     }
 
     [Fact]
-    public void AReportThatDoesNotGoThrough_IsPressedThreeTimes_ThenTheRunHalts()
+    public void AReportThatDoesNotGoThrough_IsPressedFiveTimes_ThenTheRunHalts()
     {
         var run = Started();
         Tick(run, Obs(Idle));
@@ -125,13 +127,13 @@ public class MissionRunTests
         Tick(run, Obs(Idle, clock: 40, score: 1500));
         var pressed = 0;
 
-        for (var i = 0; i < 12 && run.Active; i++)
+        for (var i = 0; i < 20 && run.Active; i++)
         {
             if (Tick(run, Obs(Idle, clock: 30, score: 1500)) == RunCommand.Report)
                 pressed++;
         }
 
-        Assert.Equal(MissionRun.MaxAttempts, pressed);
+        Assert.Equal(MissionRun.ReportAttempts, pressed);
         Assert.Equal(RunPhase.Halted, run.Phase);
         Assert.Contains("The report did not go through", run.Status);
     }
@@ -218,6 +220,196 @@ public class MissionRunTests
         Assert.Contains("Stopped by you", run.Status);
         Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, clock: 150, score: 1000)));
         Assert.Equal(RunCommand.None, run.Stop(Obs(Idle)));
+    }
+
+    // ---- accepting -----------------------------------------------------------------------------
+
+    private static readonly uint[] MasteryRows = { 1395, 1396, 1397 };
+    private static readonly uint[] BasicRows = { 101, 102, 103 };
+
+    /// <summary>The whole road in: the board, the row, Initiate, the log, the recipe - each seen before the next.</summary>
+    [Fact]
+    public void WithNoMissionInProgress_ATickedOneIsAccepted_AndItsLogOpened()
+    {
+        var run = new MissionRun();
+        Assert.True(run.Start(Obs(Idle, mission: 0), Picked, _now));
+        Assert.Equal(1395u, run.MissionId);
+
+        Assert.Equal(RunCommand.OpenBoard, Tick(run, Obs(Idle, mission: 0)));
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows)));
+        Assert.Equal(RunPhase.FindingMission, run.Phase);
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows)));
+        Assert.Equal(RunPhase.Selecting, run.Phase);
+        Assert.Equal(RunCommand.SelectMission, Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows)));
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows, selected: 1395)));
+        Assert.Equal(RunPhase.Initiating, run.Phase);
+        Assert.Equal(RunCommand.InitiateMission, Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows, selected: 1395)));
+
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, log: false))); // the game shows it in progress
+        Assert.Equal(RunPhase.OpeningLog, run.Phase);
+        Assert.Equal(RunCommand.OpenLog, Tick(run, Obs(Idle, log: false)));
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle)));
+        Assert.Equal(RunCommand.SelectRecipe, Tick(run, Obs(Idle)));
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle))); // paced: the craft is not asked for in the same breath
+        Assert.Equal(RunCommand.StartCraft, Tick(run, Obs(Idle)));
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Busy)));
+        Assert.Equal(RunPhase.Crafting, run.Phase);
+    }
+
+    [Fact]
+    public void TheBonusMission_IsTakenFirst_WhenItIsTicked()
+    {
+        var run = new MissionRun();
+
+        Assert.True(run.Start(Obs(Idle, mission: 0, bonus: 1396), Picked, _now));
+        Assert.Equal(1396u, run.MissionId);
+
+        var other = new MissionRun();
+        Assert.True(other.Start(Obs(Idle, mission: 0, bonus: 1397), Picked, _now)); // the bonus one is not ticked
+        Assert.Equal(1395u, other.MissionId);
+    }
+
+    /// <summary>Worn gear, a busy or absent Hephaestus: found out BEFORE a mission is taken, not after.</summary>
+    [Fact]
+    public void NothingIsAccepted_OnGearHephaestusWouldNotCraftOn()
+    {
+        var run = new MissionRun();
+
+        Assert.False(run.Start(Obs(Idle with { GearConditionPercent = 12 }, mission: 0), Picked, _now));
+
+        Assert.Contains("repair first", run.Status);
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, mission: 0)));
+    }
+
+    /// <summary>The board on another tab: the Tool Mastery tab is asked for, three times at most.</summary>
+    [Fact]
+    public void AMissionNotAmongTheRows_AsksForTheMasteryTab_ThenHalts()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+        Tick(run, Obs(Idle, mission: 0));
+        Tick(run, Obs(Idle, mission: 0, board: true, rows: BasicRows));
+        var asked = 0;
+
+        for (var i = 0; i < 12 && run.Active; i++)
+        {
+            if (Tick(run, Obs(Idle, mission: 0, board: true, rows: BasicRows)) == RunCommand.ShowMasteryTab)
+                asked++;
+        }
+
+        Assert.Equal(MissionRun.MaxAttempts, asked);
+        Assert.Equal(RunPhase.Halted, run.Phase);
+        Assert.Contains("not among the board's rows", run.Status);
+    }
+
+    /// <summary>Initiate is never pressed on a row that is not the selected one.</summary>
+    [Fact]
+    public void Initiate_IsOnlyPressed_OnceTheMissionIsTheSelectedOne()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+        Tick(run, Obs(Idle, mission: 0));
+        Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows));
+        Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows));
+
+        for (var i = 0; i < 12 && run.Active; i++)
+            Assert.NotEqual(RunCommand.InitiateMission, Tick(run, Obs(Idle, mission: 0, board: true, rows: MasteryRows, selected: 1397)));
+
+        Assert.Equal(RunPhase.Halted, run.Phase);
+        Assert.Contains("could not be selected", run.Status);
+    }
+
+    [Fact]
+    public void AnotherMissionTurningUpInProgress_HaltsTheRun()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+        Tick(run, Obs(Idle, mission: 0));
+
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, mission: 1397)));
+
+        Assert.Equal(RunPhase.Halted, run.Phase);
+        Assert.Contains("Another mission (1397)", run.Status);
+    }
+
+    /// <summary>A confirmation the game puts up is not answered: the run stops there and says so.</summary>
+    [Fact]
+    public void AnInitiateThatDoesNotTake_Halts_AndPointsAtAConfirmation()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+        var ready = Obs(Idle, mission: 0, board: true, rows: MasteryRows, selected: 1395);
+        Tick(run, Obs(Idle, mission: 0));
+        Tick(run, ready);
+        Tick(run, ready);
+        Tick(run, ready);
+
+        for (var i = 0; i < 15 && run.Active; i++)
+            Tick(run, ready);
+
+        Assert.Equal(RunPhase.Halted, run.Phase);
+        Assert.Contains("a confirmation may be waiting", run.Status);
+    }
+
+    /// <summary>"Commence selected mission?" - seen in game after Initiate: answered when it is about OUR mission.</summary>
+    [Fact]
+    public void TheGamesOwnConfirmation_IsAnswered_ForTheMissionSeleneWentFor()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+        var ready = Obs(Idle, mission: 0, board: true, rows: MasteryRows, selected: 1395);
+        Tick(run, Obs(Idle, mission: 0));
+        Tick(run, ready);
+        Tick(run, ready);
+        Tick(run, ready);
+        Assert.Equal(RunCommand.InitiateMission, Tick(run, ready));
+
+        var asking = ready with { ConfirmMission = 1395 };
+        Assert.Equal(RunCommand.None, Tick(run, asking)); // paced after the Initiate
+        Assert.Equal(RunCommand.ConfirmMission, Tick(run, asking));
+        Assert.Equal("Confirming the mission", run.Status);
+
+        Assert.Equal(RunCommand.None, Tick(run, Obs(Idle, log: false)));
+        Assert.Equal(RunPhase.OpeningLog, run.Phase);
+    }
+
+    /// <summary>A question about any other mission is not Selene's to answer.</summary>
+    [Fact]
+    public void AConfirmationForAnotherMission_IsNotAnswered()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+        var ready = Obs(Idle, mission: 0, board: true, rows: MasteryRows, selected: 1395);
+        Tick(run, Obs(Idle, mission: 0));
+        Tick(run, ready);
+        Tick(run, ready);
+        Tick(run, ready);
+
+        Assert.Equal(RunCommand.None, Tick(run, ready with { ConfirmMission = 1397 }));
+
+        Assert.Equal(RunPhase.Halted, run.Phase);
+        Assert.Contains("asks to commence mission 1397", run.Status);
+    }
+
+    /// <summary>The first way in still works: a mission accepted by hand, the log not open yet.</summary>
+    [Fact]
+    public void AMissionAcceptedByHand_HasItsLogOpened()
+    {
+        var run = new MissionRun();
+
+        Assert.True(run.Start(Obs(Idle, log: false), Picked, _now));
+        Assert.Equal(RunPhase.OpeningLog, run.Phase);
+        Assert.Equal(RunCommand.OpenLog, Tick(run, Obs(Idle, log: false)));
+    }
+
+    [Fact]
+    public void StoppedBeforeAnythingWasAccepted_SaysSo()
+    {
+        var run = new MissionRun();
+        run.Start(Obs(Idle, mission: 0), Picked, _now);
+
+        Assert.Equal(RunCommand.None, run.Stop(Obs(Idle, mission: 0)));
+        Assert.Contains("no mission was accepted", run.Status);
     }
 
     [Fact]
