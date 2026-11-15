@@ -133,7 +133,7 @@ public sealed class MissionCatalog
 
                 _missions[row.RowId] = new MissionInfo(
                     row.RowId, name, category == 0 ? 0 : category - 1, row.LevelGroup, row.Unknown2, row.MissionTime,
-                    row.SilverStarRequirement, row.GoldStarRequirement, recipes, special, crafts, reward, needs);
+                    row.SilverStarRequirement, row.GoldStarRequirement, recipes, special, crafts, reward, needs, row.WKSFunction.RowId);
             }
 
             foreach (var job in data.GetExcelSheet<ClassJob>())
@@ -215,7 +215,7 @@ public sealed class MissionCatalog
                     if (name.Length == 0 || !(bool)column.GetValue(jobs)! || unlocks.Exists(unlock => unlock.Action == name))
                         continue;
 
-                    unlocks.Add(new ActionNeed(name, action.ClassJobLevel, action.UnlockLink.RowId, QuestName(quests, action.UnlockLink.RowId)));
+                    unlocks.Add(new ActionNeed(name, action.ClassJobLevel, action.UnlockLink.RowId, QuestName(quests, action.UnlockLink.RowId), action.RowId));
                 }
             }
 
@@ -228,7 +228,7 @@ public sealed class MissionCatalog
                 if (name.Length == 0 || unlocks.Exists(unlock => unlock.Action == name))
                     continue;
 
-                unlocks.Add(new ActionNeed(name, action.ClassJobLevel, action.QuestRequirement.RowId, QuestName(quests, action.QuestRequirement.RowId)));
+                unlocks.Add(new ActionNeed(name, action.ClassJobLevel, action.QuestRequirement.RowId, QuestName(quests, action.QuestRequirement.RowId), action.RowId, Craft: true));
             }
 
             unlocks.Sort((a, b) => a.Level != b.Level ? a.Level.CompareTo(b.Level) : string.CompareOrdinal(a.Action, b.Action));

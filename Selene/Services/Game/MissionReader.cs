@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.Game.WKS;
@@ -25,6 +26,44 @@ public sealed unsafe class MissionReader
     /// <summary>What was read last, or why nothing was.</summary>
     public string Status { get; private set; } = "Idle — nothing read yet.";
 
+    /// <summary>Each quest asked about, and everything the game says of it: for the Debug page.</summary>
+    public string QuestDetail { get; private set; } = "Idle — no quest asked about yet.";
+
+    private static string Flag(bool value) => value ? "yes" : "no";
+
+    /// <summary>
+    /// What the GAME says of each of the job's quest-unlocked actions right now: its own status for the action
+    /// (0 = it could be used this moment; anything else is the game's reason code - not learned, wrong job,
+    /// not while doing this...). For the Debug page: added 2026-11-14, when the game told a Fisher "Collect is
+    /// required for this mission" although the quest log read Collect's quest as done. Only meaningful for the
+    /// job the character is ON.
+    /// </summary>
+    public string ActionDetail(IReadOnlyList<ActionNeed> actions)
+    {
+        try
+        {
+            var manager = ActionManager.Instance();
+            if (manager == null)
+                return "the game's action manager is not there";
+
+            var parts = new List<string>();
+            foreach (var action in actions)
+            {
+                if (action.ActionId == 0)
+                    continue;
+
+                var status = manager->GetActionStatus(action.Craft ? ActionType.CraftAction : ActionType.Action, action.ActionId);
+                parts.Add($"{action.Action} ({action.ActionId}): {(status == 0 ? "usable now" : $"status {status}")}");
+            }
+
+            return parts.Count == 0 ? "this job has no quest-unlocked action" : string.Join(" · ", parts);
+        }
+        catch (Exception ex)
+        {
+            return $"could not be read — {ex.Message}";
+        }
+    }
+
     /// <param name="missionIds">
     /// The missions to ask the game's mission log about (completed, and completed with gold): the job's own.
     /// Null = not asked.
@@ -33,20 +72,39 @@ public sealed unsafe class MissionReader
     /// The quests to ask the game about (done or not): the ones the job's missions and actions want. Read in
     /// ANY zone - a quest is the character's, not the zone's. Null = not asked.
     /// </param>
-    public MissionState Read(uint classJobId, IReadOnlyCollection<uint>? missionIds = null, IReadOnlyCollection<uint>? questIds = null)
+    /// <param name="functionIds">
+    /// The unlock functions to ask the game about (<c>WKSManager.IsFunctionUnlocked</c>): the ones the job's
+    /// missions name. Only in a Cosmic zone. Null = not asked.
+    /// </param>
+    public MissionState Read(
+        uint classJobId, IReadOnlyCollection<uint>? missionIds = null, IReadOnlyCollection<uint>? questIds = null,
+        IReadOnlyCollection<uint>? functionIds = null)
     {
         HashSet<uint>? questsDone = null;
         try
         {
             // The quest log first: it does not need a Cosmic zone. (Quest ids are 65536 + the game's own number.)
-            if (questIds != null && QuestManager.Instance() != null)
+            var quests = QuestManager.Instance();
+            if (questIds != null && quests != null)
             {
                 questsDone = new HashSet<uint>();
+                var detail = new List<string>();
                 foreach (var quest in questIds)
                 {
-                    if (QuestManager.IsQuestComplete((ushort)(quest & 0xFFFF)))
+                    var number = (ushort)(quest & 0xFFFF);
+                    var complete = QuestManager.IsQuestComplete(number);
+                    if (complete)
                         questsDone.Add(quest);
+
+                    // Everything the game will say of the quest, side by side: on 2026-11-14 "complete" read true
+                    // for a quest the player said was not done, and this is how the wrong one is to be found.
+                    var ui = UIState.Instance();
+                    detail.Add(
+                        $"{quest}: complete {Flag(complete)}, accepted {Flag(quests->IsQuestAccepted(number))}, step {QuestManager.GetQuestSequence(number)}"
+                        + (ui == null ? string.Empty : $", unlock link {Flag(ui->IsUnlockLinkUnlockedOrQuestCompleted(quest))}"));
                 }
+
+                QuestDetail = detail.Count == 0 ? "no quest asked about" : string.Join(" · ", detail);
             }
 
             var manager = WKSManager.Instance();
@@ -108,6 +166,18 @@ public sealed unsafe class MissionReader
 
             var clock = current.MissionUnitRowId != 0 ? ReadClock(out var clockDetail) : NoClock(out clockDetail);
 
+            // The game's own answer for each unlock function the job's missions name.
+            Dictionary<uint, bool>? functions = null;
+            if (functionIds != null)
+            {
+                functions = new Dictionary<uint, bool>();
+                foreach (var function in functionIds)
+                {
+                    if (function is > 0 and <= byte.MaxValue)
+                        functions[function] = manager->IsFunctionUnlocked((byte)function);
+                }
+            }
+
             // The game's mission log, mission by mission (ClientStructs' own helpers over the two flag arrays;
             // ICE's gold mode reads the same). UNSEEN IN GAME when written (2026-11-14).
             HashSet<uint>? completed = null, golded = null;
@@ -129,13 +199,16 @@ public sealed unsafe class MissionReader
                      + $" · other missions held: {(other.Count == 0 ? "none" : string.Join(", ", other))}"
                      + (golded == null ? string.Empty : $" · of the job's {missionIds!.Count} missions: {completed!.Count} completed, {golded.Count} gold")
                      + (questsDone == null ? string.Empty : $" · quests asked about: {questIds!.Count}, done: {questsDone.Count}")
+                     + (functions == null || functions.Count == 0 ? string.Empty
+                         : $" · unlock functions, by the game: {string.Join(", ", functions.Select(f => $"{f.Key} {(f.Value ? "open" : "LOCKED")}"))}")
                      + $" · current mission {current.MissionUnitRowId}, score {current.ScoreUInt}, rank {(int)current.Rank}"
                      + $" · class score {classScore} · clock: {clockDetail}";
 
             return new MissionState(
                 true, manager->TerritoryId, classJobId, current.MissionUnitRowId, current.ScoreUInt,
                 Enum.IsDefined(typeof(MissionRank), (int)current.Rank) ? (MissionRank)(int)current.Rank : MissionRank.None,
-                offered, bonus, classScore, clock, other, completed, golded, questsDone, masterBest, state.ConsecutiveGoldCount);
+                offered, bonus, classScore, clock, other, completed, golded, questsDone, masterBest, state.ConsecutiveGoldCount,
+                functions);
         }
         catch (Exception ex)
         {
@@ -155,6 +228,50 @@ public sealed unsafe class MissionReader
         {
             var bags = InventoryManager.Instance();
             return itemId == 0 || bags == null ? null : bags->GetInventoryItemCount(itemId);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// The job's cosmic tool: its stage and, a kind of data at a time, what it has, what the stage asks for and
+    /// what the stage can bank - off <c>WKSManager->ResearchModule</c>, as ICE's relic mode reads it (the tool
+    /// class is the job counted from one: Carpenter = 1). UNSEEN IN GAME when written (2026-11-14): the user's
+    /// own table showed "20.7" for every tool of one character - stage 20, seven kinds - to compare with.
+    /// Null when it cannot be read (not in a Cosmic zone, not a Cosmic job).
+    /// </summary>
+    public ToolState? ReadTool(uint classJobId, uint territoryId)
+    {
+        try
+        {
+            var manager = WKSManager.Instance();
+            var index = (int)classJobId - (int)FirstCosmicJob;
+            if (manager == null || !manager->IsLoaded || index < 0 || index >= 11)
+                return null;
+
+            var research = manager->ResearchModule;
+            if (research == null || !research->IsLoaded)
+                return null;
+
+            var toolClass = (byte)(index + 1);
+            var kinds = new List<ToolKind>();
+            for (byte kind = 1; kind <= 7 && research->IsTypeAvailable(toolClass, kind); kind++)
+            {
+                kinds.Add(new ToolKind(
+                    kind, research->GetCurrentAnalysis(toolClass, kind), research->GetNeededAnalysis(toolClass, kind),
+                    research->GetMaxAnalysis(toolClass, kind)));
+            }
+
+            var cap = ToolState.StarCaps[^1];
+            for (var star = 0; star < MissionStars.Stars.Count && star < ToolState.StarCaps.Count; star++)
+            {
+                if (MissionStars.Stars[star].TerritoryId == territoryId)
+                    cap = ToolState.StarCaps[star];
+            }
+
+            return new ToolState(research->CurrentStages[index], cap, kinds);
         }
         catch
         {

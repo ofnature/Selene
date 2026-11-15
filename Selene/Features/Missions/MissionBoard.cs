@@ -14,10 +14,19 @@ namespace Selene.Features.Missions;
 /// <param name="Payout">What the mission has been measured to pay in class points; null = never measured.</param>
 public sealed record MissionRow(
     MissionInfo Info, bool Picked, bool Offered, bool Bonus, bool Current, MissionBest? Best = null,
-    IReadOnlyList<QuestNeed>? Missing = null, uint? HighScore = null, PayoutSummary? Payout = null)
+    IReadOnlyList<QuestNeed>? Missing = null, uint? HighScore = null, PayoutSummary? Payout = null, bool? GameLocked = null)
 {
-    /// <summary>A quest it asks for is known to be missing: the game will not let the character take it.</summary>
-    public bool Locked => Missing is { Count: > 0 };
+    // [SUPERSEDED 2026-11-14 — the quest log read "Inscrutable Tastes" as done on a Fisher whose player said it
+    //  was not. The game's own answer for the mission's unlock function goes first now; the quest log only
+    //  where the game was not asked.]
+    // /// <summary>A quest it asks for is known to be missing: the game will not let the character take it.</summary>
+    // public bool Locked => Missing is { Count: > 0 };
+
+    /// <summary>
+    /// The mission cannot be taken: the game says its unlock function is locked (<see cref="GameLocked"/>) - or,
+    /// where the game was not asked, the quest log reads a quest it wants as not done.
+    /// </summary>
+    public bool Locked => GameLocked ?? Missing is { Count: > 0 };
 }
 
 /// <summary>The best result the game's mission log holds for a mission.</summary>
@@ -90,9 +99,16 @@ public static class MissionBoard
                     : MissionBest.None,
                 Missing(catalog.TryGetValue(id, out var known) ? known : null, state.QuestsDone),
                 state.MasterBest != null && state.MasterBest.TryGetValue(id, out var high) ? high : null,
-                payouts != null && payouts.TryGetValue(id, out var payout) ? payout : null))
+                payouts != null && payouts.TryGetValue(id, out var payout) ? payout : null,
+                GameLocked(catalog.TryGetValue(id, out var named) ? named : null, state.Functions)))
             .ToList();
     }
+
+    /// <summary>The game's own answer: true = the mission's unlock function is locked; null = it names none, or the game was not asked.</summary>
+    public static bool? GameLocked(MissionInfo? mission, IReadOnlyDictionary<uint, bool>? functions)
+        => mission is { UnlockFunction: not 0 } && functions != null && functions.TryGetValue(mission.UnlockFunction, out var unlocked)
+            ? !unlocked
+            : null;
 
     /// <summary>The quests a mission asks for that are not done; null when the quests were not read.</summary>
     public static IReadOnlyList<QuestNeed>? Missing(MissionInfo? mission, IReadOnlyCollection<uint>? questsDone)

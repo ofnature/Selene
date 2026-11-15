@@ -26,6 +26,12 @@ public sealed class CharacterSettings
     /// not use it: they are played to the clock.
     /// </summary>
     public Features.Missions.MissionRank ReportGoal { get; set; } = Features.Missions.MissionRank.Gold;
+
+    /// <summary>How a chain of missions picks the next one (the user, 2026-11-14: "quest chaining for different types").</summary>
+    public Features.Missions.ChainMode ChainMode { get; set; } = Features.Missions.ChainMode.Ticked;
+
+    /// <summary>A chain stops after this many missions; 0 = no limit.</summary>
+    public int ChainLimit { get; set; }
 }
 
 /// <summary>

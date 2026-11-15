@@ -25,6 +25,11 @@ namespace Selene.Features.Missions;
 /// the Cosmic log). Read from the game's data 2026-11-14: in all 312 multi-recipe crafter missions each
 /// recipe's result is either wanted by the mission or an ingredient of another of its recipes.
 /// </param>
+/// <param name="UnlockFunction">
+/// The <c>WKSFunction</c> row the mission names; 0 = none. The game answers for it itself
+/// (<c>WKSManager.IsFunctionUnlocked</c>) - asked since 2026-11-14, when the quest log read "Inscrutable Tastes"
+/// as done on a Fisher whose player said it was not.
+/// </param>
 /// <param name="Reward">What the sheets say the mission pays (<c>WKSMissionReward</c>); null when there is no row.</param>
 /// <param name="Needs">
 /// The quests the mission asks for, by the game's own data: the mission names a <c>WKSFunction</c> row, and
@@ -35,7 +40,7 @@ namespace Selene.Features.Missions;
 public sealed record MissionInfo(
     uint Id, string Name, uint ClassJobId, int LevelGroup, bool IsMaster, int TimeLimitSeconds, uint SilverScore, uint GoldScore,
     IReadOnlyList<uint> RecipeIds, MissionCategory? Special = null, IReadOnlyList<CraftStep>? Crafts = null,
-    MissionReward? Reward = null, IReadOnlyList<QuestNeed>? Needs = null)
+    MissionReward? Reward = null, IReadOnlyList<QuestNeed>? Needs = null, uint UnlockFunction = 0)
 {
     /// <summary>
     /// The tab the mission is listed under (the user, 2026-11-14: "wire in the other missions, like ice does
@@ -103,7 +108,9 @@ public sealed record QuestNeed(uint QuestId, string QuestName);
 
 /// <summary>An action of a job that a quest unlocks ("certain actions unlocked from class quests").</summary>
 /// <param name="Level">The job level the action is learned at.</param>
-public sealed record ActionNeed(string Action, int Level, uint QuestId, string QuestName);
+/// <param name="ActionId">The action's row; 0 when not kept.</param>
+/// <param name="Craft">A crafting action (the CraftAction sheet), which the game counts apart from the others.</param>
+public sealed record ActionNeed(string Action, int Level, uint QuestId, string QuestName, uint ActionId = 0, bool Craft = false);
 
 /// <summary>One recipe of a mission and how many times to make it.</summary>
 public sealed record CraftStep(uint RecipeId, int Count)
@@ -216,6 +223,7 @@ public enum MissionRank
 /// Master mission's state has over a ranked one's, unnamed in ClientStructs. UNSEEN IN GAME when added.
 /// Null = not read.
 /// </param>
+/// <param name="Functions">The game's own answer for each unlock function asked about: true = unlocked. Null = not asked (not in a Cosmic zone).</param>
 /// <param name="GoldStreak">The game's count of gold stars in a row ("Your gold count streak has reached 2! Reward bonuses have increased by 5%").</param>
 /// <param name="QuestsDone">Of the quests asked about, the ones the character has completed (read in any zone). Null = not read.</param>
 /// <param name="OfferedOther">
@@ -239,7 +247,8 @@ public sealed record MissionState(
     IReadOnlyCollection<uint>? Golded = null,
     IReadOnlyCollection<uint>? QuestsDone = null,
     IReadOnlyDictionary<uint, uint>? MasterBest = null,
-    int GoldStreak = 0)
+    int GoldStreak = 0,
+    IReadOnlyDictionary<uint, bool>? Functions = null)
 {
     /// <summary>Everything the game offers the job: the Master missions and the rest.</summary>
     public IEnumerable<uint> Offered => OfferedOther == null ? OfferedMaster : System.Linq.Enumerable.Concat(OfferedMaster, OfferedOther);

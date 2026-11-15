@@ -40,7 +40,9 @@ public sealed record MissionView(
     bool CanAccept = false, MissionRank ReportGoal = MissionRank.Gold, IReadOnlyCollection<MissionCategory>? WholeTabs = null,
     Func<uint, string>? StarName = null,
     IReadOnlyList<ActionNeed>? JobUnlocks = null, IReadOnlyCollection<uint>? QuestsDone = null,
-    uint CurrentJobId = 0, IReadOnlyList<(uint JobId, string Name)>? Classes = null, string? ClassNote = null)
+    uint CurrentJobId = 0, IReadOnlyList<(uint JobId, string Name)>? Classes = null, string? ClassNote = null,
+    ToolState? Tool = null, ChainMode ChainMode = ChainMode.Ticked, int ChainLimit = 0, bool ChainActive = false,
+    string ChainStatus = "")
 {
     /// <summary>
     /// The page shows the class the character is ON. False = another class was picked in the sidebar: its
@@ -121,6 +123,15 @@ public sealed class MainWindow : Window
 
     /// <summary>Write every measured payout to a sheet (CSV); the Debug page's Payouts line says where.</summary>
     public Action? ExportPayouts { get; set; }
+
+    /// <summary>Start running missions one after another, by the mode chosen.</summary>
+    public Action? StartChain { get; set; }
+
+    /// <summary>Let the mission in progress finish and be reported, then end the chain.</summary>
+    public Action? StopChainAfter { get; set; }
+
+    /// <summary>The chain's mode or its limit (0 = none) was changed.</summary>
+    public Action<ChainMode, int>? SetChain { get; set; }
 
     /// <summary>A class was picked in the sidebar: the Missions page shows it.</summary>
     public Action<uint>? SelectClass { get; set; }
@@ -600,6 +611,28 @@ public sealed class MainWindow : Window
             return;
         }
 
+        // The game's own answer first, an unlock function at a time (only in a Cosmic zone). Where it and the
+        // quest log disagree, BOTH are said: on 2026-11-14 the quest log read a quest as done that was not.
+        foreach (var function in view.Rows.Where(row => row.GameLocked != null).GroupBy(row => row.Info.UnlockFunction))
+        {
+            var gameLocked = function.First().GameLocked == true;
+            var quests = string.Join(" and ", (function.First().Info.Needs ?? Array.Empty<QuestNeed>()).Select(need => $"\"{need.QuestName}\""));
+            var logSaysDone = function.All(row => row.Missing is { Count: 0 });
+            if (gameLocked)
+            {
+                SeleneTheme.TextWrapped(
+                    $"{function.Count()} mission(s) are LOCKED, by the game's own answer (they need {quests})."
+                    + (logSaysDone ? " The quest log reads that as DONE - the two disagree, and the game's answer is the one Selene goes by." : string.Empty),
+                    SeleneTheme.Rose);
+            }
+            else if (!logSaysDone)
+            {
+                SeleneTheme.TextWrapped(
+                    $"The game says the {function.Count()} mission(s) needing {quests} are open, though the quest log reads that as not done. Selene goes by the game.",
+                    SeleneTheme.Amber);
+            }
+        }
+
         // The quests the missions themselves ask for (the game's own list, a mission's WKSFunction).
         var asked = view.Rows.SelectMany(row => row.Info.Needs ?? Array.Empty<QuestNeed>()).GroupBy(need => need.QuestId).ToList();
         var locked = false;
@@ -615,8 +648,9 @@ public sealed class MainWindow : Window
             SeleneTheme.TextWrapped(
                 asked.Count == 0
                     ? "None of this job's missions asks for a quest."
-                    : $"Every quest this job's missions ask for is done: {string.Join(", ", asked.Select(quest => $"\"{quest.First().QuestName}\""))}.",
+                    : $"By the quest log, every quest this job's missions ask for is done: {string.Join(", ", asked.Select(quest => $"\"{quest.First().QuestName}\""))}.",
                 SeleneTheme.TextSecondary);
+            SeleneTheme.Tooltip("Selene's reading of the quest log - which has been wrong once. In a Cosmic zone the game's own answer is shown above this line when the two differ, and is what Selene goes by. The Debug page's \"Quests\" line has everything the game says of each quest.");
         }
 
         // The job's actions that a quest unlocks.
@@ -840,6 +874,88 @@ public sealed class MainWindow : Window
         ImGui.SameLine();
         SeleneTheme.TextWrapped(view.RunStatus, view.RunActive ? SeleneTheme.StatusGreen : SeleneTheme.TextSecondary);
         SeleneTheme.VSpace(4f);
+        DrawChainControls(view);
+    }
+
+    private static string ChainName(ChainMode mode) => mode switch
+    {
+        ChainMode.GoldAll => "Gold all",
+        ChainMode.LevelTool => "Level the tool",
+        ChainMode.ClassPoints => "Class points",
+        _ => "Ticked missions",
+    };
+
+    private static string ChainHelp(ChainMode mode) => mode switch
+    {
+        ChainMode.GoldAll => "Runs whatever on offer is not gold yet, lowest rank first, each reported at gold. Ends when every mission Selene can run on this star is gold. Master missions have no star and are left out.",
+        ChainMode.LevelTool => "Runs whatever on offer pays most of the data the cosmic tool still lacks. Ends when the tool has all its stage asks for: handing it in at Researchingway is still yours to do.",
+        ChainMode.ClassPoints => "Runs Master missions (the ticked ones, else any) and reports each as soon as the game ranks it. One not measured yet goes first; after that the one that pays the most class points a minute.",
+        _ => "Runs the missions ticked one by one and whatever the game offers on a tab ticked as a whole, each reported at the rank beside Run.",
+    };
+
+    /// <summary>
+    /// Missions one after another (the user, 2026-11-14: "quest chaining for different types"): how the next
+    /// one is chosen, an optional number to stop at, and the two ways to end it. Nothing is re-rolled: when
+    /// nothing wanted is on offer the chain stops and says so.
+    /// </summary>
+    private void DrawChainControls(MissionView view)
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+        SeleneTheme.Text("Then keep going:", SeleneTheme.TextDim);
+        ImGui.SameLine();
+
+        ImGui.BeginDisabled(view.ChainActive);
+        ImGui.SetNextItemWidth(140f * scale);
+        using (var modes = ImRaii.Combo("##SeleneChainMode", ChainName(view.ChainMode)))
+        {
+            if (modes)
+            {
+                foreach (var mode in new[] { ChainMode.Ticked, ChainMode.GoldAll, ChainMode.LevelTool, ChainMode.ClassPoints })
+                {
+                    if (ImGui.Selectable(ChainName(mode), mode == view.ChainMode))
+                        SetChain?.Invoke(mode, view.ChainLimit);
+                    SeleneTheme.Tooltip(ChainHelp(mode));
+                }
+            }
+        }
+
+        SeleneTheme.Tooltip(ChainHelp(view.ChainMode));
+
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(70f * scale);
+        var limit = view.ChainLimit;
+        if (ImGui.InputInt("##SeleneChainLimit", ref limit, 0, 0) && limit != view.ChainLimit)
+            SetChain?.Invoke(view.ChainMode, limit);
+        SeleneTheme.Tooltip("Stop after this many missions. 0 = no limit: it goes on until the mode's goal is reached, nothing wanted is on offer, or something stops it.");
+        ImGui.EndDisabled();
+
+        ImGui.SameLine();
+        ImGui.BeginDisabled(view.ChainActive || !view.State.InZone);
+        if (ImGui.Button("Start chain", new Vector2(100f * scale, 0f)))
+            StartChain?.Invoke();
+        ImGui.EndDisabled();
+        SeleneTheme.Tooltip("Runs missions one after another, with a pause between them that is not the same every time. Stop ends it at once; \"After this one\" lets the mission in progress finish first. BUILT, NEVER RUN: stay and watch the first chains.");
+
+        ImGui.SameLine();
+        ImGui.BeginDisabled(!view.ChainActive);
+        if (ImGui.Button("After this one", new Vector2(110f * scale, 0f)))
+            StopChainAfter?.Invoke();
+        ImGui.EndDisabled();
+        SeleneTheme.Tooltip("The mission in progress is finished and reported, then the chain ends.");
+
+        if (view.ChainStatus.Length > 0)
+            SeleneTheme.TextWrapped(view.ChainStatus, view.ChainActive ? SeleneTheme.StatusGreen : SeleneTheme.TextSecondary);
+
+        // The tool the "level the tool" mode works on - and what a tool-data figure in the table is worth to it.
+        if (view.Tool is { } tool)
+        {
+            SeleneTheme.TextWrapped(
+                $"Cosmic tool: {tool.Text}" + (tool.ReadyToHandIn ? " — READY TO HAND IN at Researchingway" : tool.Full ? " — full" : string.Empty),
+                tool.ReadyToHandIn ? SeleneTheme.Amber : SeleneTheme.TextSecondary);
+            SeleneTheme.Tooltip("Stage, and for each kind of data what the tool has against what the stage asks for. A mission's \"Tool data\" column is what it pays of each kind.");
+        }
+
+        SeleneTheme.VSpace(4f);
     }
 
     private static void DrawMissionTiles(MissionView view)
@@ -917,7 +1033,10 @@ public sealed class MainWindow : Window
             SeleneTheme.Tooltip(
                 $"Mission {info.Id} · {TabName(info.Category)} · tier {info.LevelGroup} · recipes {(info.RecipeIds.Count == 0 ? "none" : string.Join(", ", info.RecipeIds))}"
                 + (info.Needs is { Count: > 0 } needs ? $" · needs the quest {string.Join(" and ", needs.Select(need => $"\"{need.QuestName}\""))}" : string.Empty)
-                + (row.Locked ? $" — NOT DONE: {string.Join(", ", row.Missing!.Select(need => $"\"{need.QuestName}\""))}" : string.Empty));
+                + (row.GameLocked == true ? " — LOCKED, by the game's own answer"
+                    : row.GameLocked == false ? " — open, by the game's own answer"
+                    : row.Locked ? $" — NOT DONE by the quest log: {string.Join(", ", row.Missing!.Select(need => $"\"{need.QuestName}\""))}"
+                    : string.Empty));
 
             ImGui.TableNextColumn();
             SeleneTheme.Text(info.TimeLimitSeconds > 0 ? $"{info.TimeLimitSeconds / 60}:{info.TimeLimitSeconds % 60:00}" : "untimed", SeleneTheme.TextDim);

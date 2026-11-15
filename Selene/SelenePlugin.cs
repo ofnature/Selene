@@ -56,6 +56,11 @@ public sealed class SelenePlugin : IDalamudPlugin
     private readonly StandWalk _walk = new();
     private readonly PayoutWatch _payoutWatch = new();
     private readonly PayoutLog _payouts;
+    private readonly MissionChain _chain = new();
+
+    /// <summary>"Start chain" / "Stop after this mission" were pressed on the Missions page; the tick acts on them.</summary>
+    private bool _chainStartRequested;
+    private bool _chainStopAfterRequested;
 
     /// <summary>The place the last look for water chose, and its facing: where the walk test goes.</summary>
     private (Vector3 At, float Facing)? _chosen;
@@ -74,7 +79,12 @@ public sealed class SelenePlugin : IDalamudPlugin
     // private IReadOnlyCollection<uint> _jobQuests = Array.Empty<uint>();
 
     /// <summary>What is asked of the game about one job, made once a job: its missions, its quest-unlocked actions, the quests behind both.</summary>
-    private sealed record JobData(IReadOnlyCollection<uint> Missions, IReadOnlyList<ActionNeed> Unlocks, IReadOnlyCollection<uint> Quests);
+    private sealed record JobData(
+        IReadOnlyCollection<uint> Missions, IReadOnlyList<ActionNeed> Unlocks, IReadOnlyCollection<uint> Quests,
+        IReadOnlyCollection<uint> Functions);
+
+    /// <summary>The game's own answer for the unlock functions of the character's OWN job's missions: what Run goes by first.</summary>
+    private IReadOnlyDictionary<uint, bool>? _functions;
 
     private readonly Dictionary<uint, JobData> _jobData = new();
 
@@ -144,6 +154,9 @@ public sealed class SelenePlugin : IDalamudPlugin
         _classes = Enumerable.Range((int)MissionInfo.FirstCrafter, 11).Select(id => ((uint)id, _catalog.JobName((uint)id))).ToList();
         _mainWindow.SelectClass = picked => { _viewJob = picked; _classNote = null; _nextTick = default; };
         _mainWindow.ChangeClass = wanted => { _changeJobRequested = wanted; _nextTick = default; };
+        _mainWindow.StartChain = () => { _chainStartRequested = true; _nextTick = default; };
+        _mainWindow.StopChainAfter = () => { _chainStopAfterRequested = true; _nextTick = default; };
+        _mainWindow.SetChain = SetChain;
         _mainWindow.ExportPayouts = () =>
         {
             _payouts.ExportCsv(id => _catalog.Missions.TryGetValue(id, out var mission) ? mission.Name.Trim() : $"Mission {id}");
@@ -266,11 +279,12 @@ public sealed class SelenePlugin : IDalamudPlugin
             _viewJob = 0; // the character is on the picked class now: the page follows the character again
         var viewJob = _viewJob != 0 ? _viewJob : job;
         var viewData = DataFor(viewJob);
-        var viewState = viewJob == job ? null : _missionReader.Read(viewJob, viewData.Missions, viewData.Quests);
+        var viewState = viewJob == job ? null : _missionReader.Read(viewJob, viewData.Missions, viewData.Quests, viewData.Functions);
 
         var mineData = DataFor(job);
-        var missionState = _missionReader.Read(job, mineData.Missions, mineData.Quests);
+        var missionState = _missionReader.Read(job, mineData.Missions, mineData.Quests, mineData.Functions);
         _questsDone = missionState.QuestsDone;
+        _functions = missionState.Functions;
         viewState ??= missionState;
 
         // What a finished mission paid, whoever ran it: the class score before and after, kept a file a character.
@@ -318,6 +332,18 @@ public sealed class SelenePlugin : IDalamudPlugin
         var observation = new RunObservation(
             missionState, hephaestus, _missionWindows.LogOpen, board.Open, board.Missions, board.Selected,
             _missionWindows.ConfirmingMission());
+        // The cosmic tool of the character's job (for the "level the tool" chain) and of the class shown.
+        var tool = missionState.InZone ? _missionReader.ReadTool(job, missionState.TerritoryId) : null;
+        var viewTool = viewJob == job ? tool : viewState.InZone ? _missionReader.ReadTool(viewJob, viewState.TerritoryId) : null;
+
+        if (_chainStopAfterRequested)
+            _chain.StopAfterThis();
+        if (_chainStartRequested && !_chain.Active && !_stopRequested)
+            _chain.Start(character?.ChainMode ?? ChainMode.Ticked, character?.ChainLimit ?? 0, now);
+        _chainStartRequested = _chainStopAfterRequested = false;
+
+        if (_stopRequested)
+            _chain.Stop("Stopped by you.");
         if (_stopRequested)
             Execute(_run.Stop(observation));
         // [SUPERSEDED 2026-11-14 — every kind of mission can be ticked now; only Master crafting ones are run]
@@ -327,6 +353,11 @@ public sealed class SelenePlugin : IDalamudPlugin
             _run.Start(observation, runnable, now);
         _runRequested = _stopRequested = false;
         Execute(_run.Tick(observation, now));
+
+        // The chain: when a mission is due, which one - and the run is asked to take exactly that one.
+        var next = _chain.Tick(_run.Phase, _run.Status, () => ChooseNext(missionState, picks, wholeTabs, tool, contentId, now), now, contentId);
+        if (next != 0 && !_run.Start(observation, new[] { next }, now))
+            _chain.Stop($"Stopped — the mission was not started: {_run.Status}");
 
         // The sidebar's "Change to ..." was pressed: Hephaestus changes the job (the careful change its own queue
         // makes). Never under a run or with a mission in progress; what came of it shows as the character's job.
@@ -368,7 +399,12 @@ public sealed class SelenePlugin : IDalamudPlugin
             QuestsDone: viewState.QuestsDone,
             CurrentJobId: job,
             Classes: _classes,
-            ClassNote: _classNote);
+            ClassNote: _classNote,
+            Tool: viewTool,
+            ChainMode: character?.ChainMode ?? ChainMode.Ticked,
+            ChainLimit: character?.ChainLimit ?? 0,
+            ChainActive: _chain.Active,
+            ChainStatus: _chain.Status);
 
         var rows = ScheduleBoard.Build(_roster.Names, contentId, _schedule, now);
         var mine = rows.FirstOrDefault(row => row.IsThisCharacter);
@@ -379,8 +415,11 @@ public sealed class SelenePlugin : IDalamudPlugin
             ("Roster", _roster.Status),
             ("Mission sheets", _catalog.Status),
             ("Missions", _missionReader.Status),
+            ("Quests", _missionReader.QuestDetail),
+            ("Actions", _missionReader.ActionDetail(mineData.Unlocks)),
             ("Hephaestus", _hephaestus.Status),
             ("Mission run", _run.Status),
+            ("Chain", _chain.Status),
             ("Asked of Heph.", _hephaestus.LastAction),
             ("Windows", _missionWindows.Status),
             ("Confirmation", _missionWindows.ConfirmDetail),
@@ -410,7 +449,8 @@ public sealed class SelenePlugin : IDalamudPlugin
             .Concat(unlocks.Select(unlock => unlock.QuestId))
             .Distinct()
             .ToList();
-        return _jobData[job] = new JobData(ofJob.Select(mission => mission.Id).ToList(), unlocks, quests);
+        var functions = ofJob.Select(mission => mission.UnlockFunction).Where(function => function != 0).Distinct().ToList();
+        return _jobData[job] = new JobData(ofJob.Select(mission => mission.Id).ToList(), unlocks, quests, functions);
     }
 
     /// <summary>The one thing the walk test asked for this tick. What came of it is read off the game next tick.</summary>
@@ -507,7 +547,8 @@ public sealed class SelenePlugin : IDalamudPlugin
            && MissionInfo.IsCrafter(mission.ClassJobId)
            && mission.Category != MissionCategory.RedAlert
            && mission.RecipeIds.Count > 0
-           && MissionBoard.Missing(mission, _questsDone) is not { Count: > 0 }; // a quest it asks for is not done: the game will not give it
+           // Locked: the game's own answer for the mission's unlock function first; the quest log where it was not asked.
+           && !(MissionBoard.GameLocked(mission, _functions) ?? MissionBoard.Missing(mission, _questsDone) is { Count: > 0 });
 
     /// <summary>
     /// How a mission is run. A Master mission: to the clock, its one recipe in the Cosmic log - as run since
@@ -516,11 +557,64 @@ public sealed class SelenePlugin : IDalamudPlugin
     /// </summary>
     private MissionPlan PlanFor(uint missionId)
     {
-        if (!_catalog.Missions.TryGetValue(missionId, out var mission) || mission.IsMaster)
+        // [SUPERSEDED 2026-11-14 by the chain's modes — a mode can set the rank a mission is reported at]
+        // if (!_catalog.Missions.TryGetValue(missionId, out var mission) || mission.IsMaster)
+        //     return MissionPlan.Master;
+        //
+        // var goal = _config.Characters.TryGetValue(_character.ContentId, out var kept) ? kept.ReportGoal : MissionRank.Gold;
+        // return new MissionPlan(mission.TimeLimitSeconds > 0, goal, mission.Crafts);
+        if (!_catalog.Missions.TryGetValue(missionId, out var mission))
             return MissionPlan.Master;
 
-        var goal = _config.Characters.TryGetValue(_character.ContentId, out var kept) ? kept.ReportGoal : MissionRank.Gold;
+        var mode = _chain.Active ? _chain.Mode : (ChainMode?)null;
+        if (mission.IsMaster)
+        {
+            // For class points a Master mission is reported as soon as the game ranks it (ICE's "quick turn-in":
+            // class points look fixed a report, so the sooner the better) - still never past the clock's margin.
+            // THAT A MASTER MISSION'S RANK REACHES 3 AT ITS FIRST OBJECTIVE IS ICE'S READING, UNSEEN.
+            return mode == ChainMode.ClassPoints ? new MissionPlan(Timed: true, ReportAt: MissionRank.Gold) : MissionPlan.Master;
+        }
+
+        var goal = mode == ChainMode.GoldAll ? MissionRank.Gold
+            : _config.Characters.TryGetValue(_character.ContentId, out var kept) ? kept.ReportGoal
+            : MissionRank.Gold;
         return new MissionPlan(mission.TimeLimitSeconds > 0, goal, mission.Crafts);
+    }
+
+    /// <summary>
+    /// The chain's next mission. With one already in progress it is that one (if Selene can run it); else the
+    /// mode's choice among what the game offers this job on this star.
+    /// </summary>
+    private Choice ChooseNext(
+        MissionState state, IReadOnlyCollection<uint> picks, IReadOnlyCollection<MissionCategory> wholeTabs, ToolState? tool,
+        ulong contentId, DateTime now)
+    {
+        if (!state.InZone)
+            return new Choice(0, "not in a Cosmic Exploration zone");
+        if (state.InMission)
+        {
+            return Runnable(state.CurrentMissionId)
+                ? new Choice(state.CurrentMissionId, "the mission in progress")
+                : new Choice(0, $"mission {state.CurrentMissionId} is in progress and is not one Selene can run");
+        }
+
+        var here = MissionBoard.On(MissionBoard.Build(_catalog.Missions, state, picks, _payouts.Summaries), state.TerritoryId);
+        return MissionChooser.Choose(
+            _chain.Mode, here, mission => Runnable(mission.Id), wholeTabs, tool, contentId, (now.DayOfYear * 1000) + _chain.Completed);
+    }
+
+    /// <summary>The chain's mode or limit was changed on the Missions page: kept for the logged-in character.</summary>
+    private void SetChain(ChainMode mode, int limit)
+    {
+        var contentId = _character.ContentId;
+        if (contentId == 0)
+            return;
+
+        var settings = _config.For(contentId);
+        settings.ChainMode = mode;
+        settings.ChainLimit = Math.Clamp(limit, 0, 999);
+        SaveConfig();
+        _nextTick = default;
     }
 
     /// <summary>A tab was ticked or unticked as a whole on the Missions page: kept for the logged-in character.</summary>
