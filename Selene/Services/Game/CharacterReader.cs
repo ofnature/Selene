@@ -39,6 +39,29 @@ public sealed unsafe class CharacterReader
     /// <summary>The job the character is on; 0 while there is no character in the world.</summary>
     public uint ClassJobId => _objectTable.LocalPlayer?.ClassJob.RowId ?? 0;
 
+    /// <summary>Where the character stands; null while there is no character in the world.</summary>
+    public System.Numerics.Vector3? Position => _objectTable.LocalPlayer?.Position;
+
+    /// <summary>Which way the character faces (the game's rotation); 0 while there is no character.</summary>
+    public float Rotation => _objectTable.LocalPlayer?.Rotation ?? 0f;
+
+    /// <summary>
+    /// Turn the character to a rotation, as Demeter turns it to the water (<c>GameObject.SetRotation</c>).
+    /// Whether it turned is read back from <see cref="Rotation"/>. Only the walk test calls this.
+    /// </summary>
+    public void Face(float rotation)
+    {
+        try
+        {
+            if (_objectTable.LocalPlayer is { } player)
+                ((FFXIVClientStructs.FFXIV.Client.Game.Object.GameObject*)player.Address)->SetRotation(rotation);
+        }
+        catch
+        {
+            // Fail-open: the caller reads the rotation and sees it did not turn.
+        }
+    }
+
     /// <summary>Who it sees, or why it sees nobody.</summary>
     public string Status
     {

@@ -73,6 +73,9 @@ public enum RunCommand
     /// <summary><c>Hephaestus.CraftSelected(<see cref="MissionRun.CraftAmount"/>)</c>.</summary>
     StartCraft,
 
+    /// <summary><c>Hephaestus.CraftItem</c> for <see cref="MissionRun.Step"/>: one recipe of a multi-recipe mission, by its id.</summary>
+    StartCraftStep,
+
     /// <summary><c>Hephaestus.RequestStopAfterRun</c>: the item in hand is finished, nothing new starts.</summary>
     StopAfterItem,
 
@@ -131,9 +134,24 @@ public sealed class MissionRun
     public static readonly TimeSpan FinishDeadline = TimeSpan.FromSeconds(180);
     public static readonly TimeSpan ReportDeadline = TimeSpan.FromSeconds(40);
 
+    private readonly Func<uint, MissionPlan>? _planFor;
+    private MissionPlan _plan = MissionPlan.Master;
+    private int _step;
     private DateTime _deadline;
     private DateTime _nextCommandAt;
     private int _attempts;
+
+    /// <param name="planFor">
+    /// How each mission is to be run (added 2026-11-14 for the missions that are not Master ones: untimed,
+    /// reported at a rank, some of several recipes). Without it every mission is run as a Master one.
+    /// </param>
+    public MissionRun(Func<uint, MissionPlan>? planFor = null)
+    {
+        _planFor = planFor;
+    }
+
+    /// <summary>The craft a multi-recipe mission is on; null for a one-recipe mission.</summary>
+    public CraftStep? Step => _plan.Steps is { } steps && _step < steps.Count ? steps[_step] : null;
 
     public RunPhase Phase { get; private set; } = RunPhase.Idle;
 
@@ -155,7 +173,10 @@ public sealed class MissionRun
     /// where it stands; with none, a ticked mission the game offers is accepted first - the bonus one if it
     /// is ticked, else the first. False = nothing started, and <see cref="Status"/> says what is missing.
     /// </summary>
-    /// <param name="picked">The missions the user ticked: Selene runs no other.</param>
+    /// <param name="picked">
+    /// The ticked missions Selene can run: it runs no other. The caller leaves out what is ticked but not
+    /// runnable yet (since 2026-11-14 every kind of mission can be ticked; only Master crafting ones run).
+    /// </param>
     public bool Start(RunObservation obs, IReadOnlyCollection<uint> picked, DateTime now)
     {
         if (Active)
@@ -163,18 +184,27 @@ public sealed class MissionRun
 
         var mission = obs.Mission;
         var hephaestus = obs.Hephaestus;
-        var offeredAndPicked = mission.OfferedMaster.Where(picked.Contains).ToList();
+        // [SUPERSEDED 2026-11-14 — the other kinds of mission are run too: any list the game holds counts]
+        // var offeredAndPicked = mission.OfferedMaster.Where(picked.Contains).ToList();
+        var offeredAndPicked = mission.Offered.Where(picked.Contains).Distinct().ToList();
+        var target = mission.InMission ? mission.CurrentMissionId
+            : offeredAndPicked.Count == 0 ? 0
+            : offeredAndPicked.Contains(mission.BonusMasterId) ? mission.BonusMasterId
+            : offeredAndPicked[0];
+        var plan = _planFor?.Invoke(target) ?? MissionPlan.Master;
 
         // Checked BEFORE anything is accepted: no mission is taken on gear, or a crafter, that cannot do it.
         var refusal =
             !mission.InZone ? "not in a Cosmic Exploration zone"
-            : mission.InMission && !picked.Contains(mission.CurrentMissionId) ? $"mission {mission.CurrentMissionId} is not one you ticked"
-            : !mission.InMission && offeredAndPicked.Count == 0 ? "none of the missions you ticked is offered right now"
+            : mission.InMission && !picked.Contains(mission.CurrentMissionId)
+                ? $"mission {mission.CurrentMissionId} is not one you ticked that Selene can run (Master crafting missions so far)"
+            : !mission.InMission && offeredAndPicked.Count == 0
+                ? "none of the missions you ticked is offered right now (Selene runs Master crafting missions so far)"
             : !hephaestus.Available ? "Hephaestus is not loaded"
             : hephaestus.Busy ? "Hephaestus is busy"
             : !hephaestus.ReportsGear ? "this Hephaestus does not report its gear gate — update Hephaestus"
             : !hephaestus.GearFit ? $"gear is at {hephaestus.GearConditionPercent}% (gate {hephaestus.GearGatePercent}%) — repair first"
-            : !mission.InMission ? null
+            : !mission.InMission || !plan.Timed ? null
             : mission.ClockSeconds is not { } clock ? "the mission's clock cannot be seen"
             : clock <= StopMarginSeconds ? $"only {clock} s left on the clock — report it yourself"
             : null;
@@ -186,18 +216,22 @@ public sealed class MissionRun
             return false;
         }
 
+        MissionId = target;
+        _plan = plan;
+        _step = 0;
+
         if (mission.InMission)
         {
-            MissionId = mission.CurrentMissionId;
             LastScore = mission.Score;
-            if (obs.LogOpen)
+            if (_plan.Steps != null || obs.LogOpen)
                 Enter(RunPhase.StartingCraft, now, StartDeadline, "Asking Hephaestus to craft");
             else
                 Enter(RunPhase.OpeningLog, now, StepDeadline, "Opening the Cosmic Crafting Log");
             return true;
         }
 
-        MissionId = offeredAndPicked.Contains(mission.BonusMasterId) ? mission.BonusMasterId : offeredAndPicked[0];
+        // [SUPERSEDED 2026-11-14 — chosen above, with the plan]
+        // MissionId = offeredAndPicked.Contains(mission.BonusMasterId) ? mission.BonusMasterId : offeredAndPicked[0];
         LastScore = 0;
         Enter(RunPhase.OpeningBoard, now, StepDeadline, $"Opening the mission board for mission {MissionId}");
         return true;
@@ -238,7 +272,11 @@ public sealed class MissionRun
                 return RunCommand.None;
             }
 
-            Enter(RunPhase.OpeningLog, now, StepDeadline, "Accepted — opening the Cosmic Crafting Log");
+            // A multi-recipe mission is crafted by recipe id: Hephaestus opens the log for each itself.
+            if (_plan.Steps != null)
+                Enter(RunPhase.StartingCraft, now, StartDeadline, "Accepted — asking Hephaestus for the first craft");
+            else
+                Enter(RunPhase.OpeningLog, now, StepDeadline, "Accepted — opening the Cosmic Crafting Log");
             return RunCommand.None;
         }
 
@@ -346,19 +384,35 @@ public sealed class MissionRun
                     return RunCommand.None;
                 }
 
-                return Try(RunCommand.StartCraft, now, "Hephaestus did not start crafting");
+                return Try(Step != null ? RunCommand.StartCraftStep : RunCommand.StartCraft, now, "Hephaestus did not start crafting");
 
             case RunPhase.Crafting:
-                if (clock is not { } left || left <= StopMarginSeconds)
+                // A timed mission: never past the margin. (An untimed one has no clock to see.)
+                if (_plan.Timed && (clock is not { } remaining || remaining <= StopMarginSeconds))
                 {
                     Enter(RunPhase.Finishing, now, FinishDeadline,
                         clock == null ? "The clock cannot be seen — finishing the item in hand" : $"{clock} s left — finishing the item in hand");
                     return busy ? RunCommand.StopAfterItem : RunCommand.None;
                 }
 
+                // The user's goal for a ranked mission: the rank is there, so nothing more is started.
+                if (_plan.ReportAt is { } goal && mission.Rank != MissionRank.Failed && mission.Rank >= goal)
+                {
+                    Enter(RunPhase.Finishing, now, FinishDeadline, $"{mission.Rank} reached — finishing the item in hand");
+                    return busy ? RunCommand.StopAfterItem : RunCommand.None;
+                }
+
                 if (!busy)
                 {
-                    // Hephaestus stopped by itself: out of materials, worn gear, a failed start.
+                    // One craft of several is over, whichever way: the next one. What was made shows in the score.
+                    if (_plan.Steps is { } steps && _step < steps.Count - 1)
+                    {
+                        _step++;
+                        Enter(RunPhase.StartingCraft, now, StartDeadline, $"Craft {_step + 1} of {steps.Count} — asking Hephaestus");
+                        return RunCommand.None;
+                    }
+
+                    // Hephaestus stopped by itself: made what there was to make, out of materials, worn gear, a failed start.
                     var why = obs.Hephaestus.RunHalt != "None" ? obs.Hephaestus.RunHalt : "it stopped";
                     if (mission.Score == 0)
                         return HaltNone($"Hephaestus stopped before anything was scored ({why})");
@@ -367,7 +421,9 @@ public sealed class MissionRun
                     return RunCommand.None;
                 }
 
-                Status = $"Crafting — score {Number(mission.Score)}, {left / 60}:{left % 60:00} left";
+                Status = clock is { } left
+                    ? $"Crafting — score {Number(mission.Score)}, {left / 60}:{left % 60:00} left"
+                    : $"Crafting — score {Number(mission.Score)}, rank {mission.Rank}";
                 return RunCommand.None;
 
             case RunPhase.Finishing:

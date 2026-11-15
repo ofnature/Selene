@@ -17,6 +17,8 @@ public sealed class HephaestusClient
     private readonly ICallGateSubscriber<bool> _isBusy;
     private readonly ICallGateSubscriber<string> _queueStatusJson;
     private readonly ICallGateSubscriber<int, bool> _craftSelected;
+    private readonly ICallGateSubscriber<uint, int, bool> _craftItem;
+    private readonly ICallGateSubscriber<uint, bool> _changeJob;
     private readonly ICallGateSubscriber<bool> _requestStopAfterRun;
 
     public HephaestusClient(IDalamudPluginInterface pluginInterface)
@@ -25,6 +27,8 @@ public sealed class HephaestusClient
         _isBusy = pluginInterface.GetIpcSubscriber<bool>("Hephaestus.IsBusy");
         _queueStatusJson = pluginInterface.GetIpcSubscriber<string>("Hephaestus.GetQueueStatusJson");
         _craftSelected = pluginInterface.GetIpcSubscriber<int, bool>("Hephaestus.CraftSelected");
+        _craftItem = pluginInterface.GetIpcSubscriber<uint, int, bool>("Hephaestus.CraftItem");
+        _changeJob = pluginInterface.GetIpcSubscriber<uint, bool>("Hephaestus.ChangeJob");
         _requestStopAfterRun = pluginInterface.GetIpcSubscriber<bool>("Hephaestus.RequestStopAfterRun");
     }
 
@@ -49,6 +53,46 @@ public sealed class HephaestusClient
         catch
         {
             LastAction = "CraftSelected: this Hephaestus has no such gate (an older build)";
+        }
+    }
+
+    /// <summary>
+    /// <c>Hephaestus.CraftItem</c>: make <paramref name="amount"/> of a recipe BY ITS ID - for a mission of
+    /// several recipes, where Selene does not know which row of the Cosmic log is which. By Hephaestus's own
+    /// notes it reaches a Cosmic mission's recipe (it opens the Cosmic log and picks the recipe from its list)
+    /// and closes the log when done - NOT SEEN IN GAME there or here. The answer is only a hint.
+    /// </summary>
+    public void CraftItem(uint recipeId, int amount)
+    {
+        try
+        {
+            LastAction = _craftItem.InvokeFunc(recipeId, amount)
+                ? $"CraftItem({recipeId}, {amount}): began"
+                : $"CraftItem({recipeId}, {amount}): refused — unknown recipe, or Hephaestus busy";
+        }
+        catch
+        {
+            LastAction = "CraftItem: this Hephaestus has no such gate";
+        }
+    }
+
+    /// <summary>
+    /// <c>Hephaestus.ChangeJob</c>: put the character on a job - the careful change Hephaestus's queue makes
+    /// (close the log, equip the saved gearset, watch the job change). Any job with a saved gearset, the
+    /// gatherers too. The answer is only a hint: the job the character is on is the verdict. NOT SEEN IN GAME
+    /// from Selene when written (2026-11-14).
+    /// </summary>
+    public void ChangeJob(uint classJobId)
+    {
+        try
+        {
+            LastAction = _changeJob.InvokeFunc(classJobId)
+                ? $"ChangeJob({classJobId}): began, or already on it"
+                : $"ChangeJob({classJobId}): refused — no gearset saved for the job, or Hephaestus busy";
+        }
+        catch
+        {
+            LastAction = "ChangeJob: this Hephaestus has no such gate (an older build)";
         }
     }
 

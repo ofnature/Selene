@@ -31,9 +31,23 @@ public sealed record ScheduleView(
 /// <param name="Rows">The job's Master missions: the sheets' and the game's, with the user's picks.</param>
 /// <param name="RunActive">A mission run is going.</param>
 /// <param name="RunStatus">What the run is doing, or why it is not.</param>
+/// <param name="CanAccept">The game holds a mission Run would take: one ticked, or one of a tab ticked as a whole.</param>
+/// <param name="ReportGoal">The rank at which this character's ranked missions are reported.</param>
+/// <param name="WholeTabs">The tabs ticked as a whole: "run whatever the game offers of this kind".</param>
 public sealed record MissionView(
     uint ClassJobId, string JobName, MissionState State, IReadOnlyList<MissionRow> Rows, HephaestusStatus Hephaestus,
-    bool RunActive, string RunStatus);
+    bool RunActive, string RunStatus,
+    bool CanAccept = false, MissionRank ReportGoal = MissionRank.Gold, IReadOnlyCollection<MissionCategory>? WholeTabs = null,
+    Func<uint, string>? StarName = null,
+    IReadOnlyList<ActionNeed>? JobUnlocks = null, IReadOnlyCollection<uint>? QuestsDone = null,
+    uint CurrentJobId = 0, IReadOnlyList<(uint JobId, string Name)>? Classes = null, string? ClassNote = null)
+{
+    /// <summary>
+    /// The page shows the class the character is ON. False = another class was picked in the sidebar: its
+    /// missions, unlocks and scores are shown (<see cref="ClassJobId"/> is the class SHOWN), and nothing can be run.
+    /// </summary>
+    public bool OnThisClass => CurrentJobId == 0 || CurrentJobId == ClassJobId;
+}
 
 public enum MainPage
 {
@@ -92,6 +106,33 @@ public sealed class MainWindow : Window
 
     /// <summary>The edge dock's own Status line, for the Debug page.</summary>
     public Func<string> DockStatus { get; set; } = () => "off";
+
+    /// <summary>The Debug page's "Look for water here": a look only, nothing moves. Null = no button.</summary>
+    public Action? LookForWater { get; set; }
+
+    /// <summary>Take the water look's markers off the screen. Null = no button.</summary>
+    public Action? HideWaterMarks { get; set; }
+
+    /// <summary>The Debug page's walk test: walk to the place the last look chose. Moves the character.</summary>
+    public Action? WalkToSpot { get; set; }
+
+    /// <summary>Stop the walk test.</summary>
+    public Action? StopWalk { get; set; }
+
+    /// <summary>Write every measured payout to a sheet (CSV); the Debug page's Payouts line says where.</summary>
+    public Action? ExportPayouts { get; set; }
+
+    /// <summary>A class was picked in the sidebar: the Missions page shows it.</summary>
+    public Action<uint>? SelectClass { get; set; }
+
+    /// <summary>"Change to ..." in the sidebar: put the character on that class (Hephaestus does it).</summary>
+    public Action<uint>? ChangeClass { get; set; }
+
+    /// <summary>A Missions tab was ticked (true) or unticked as a whole: "run whatever the game offers of this kind".</summary>
+    public Action<MissionCategory, bool>? SetWholeTab { get; set; }
+
+    /// <summary>The rank at which ranked missions are reported was chosen.</summary>
+    public Action<MissionRank>? SetReportGoal { get; set; }
 
     // [SUPERSEDED 2026-11-12 by the sidebar layout below — the first window's two tabs]
     // public override void Draw()
@@ -218,6 +259,51 @@ public sealed class MainWindow : Window
         SeleneTheme.SectionLabel("System");
         Tab("Settings", FontAwesomeIcon.Cog, MainPage.Settings);
         Tab("Debug", FontAwesomeIcon.Bug, MainPage.Debug);
+        DrawClassPicker();
+    }
+
+    /// <summary>
+    /// The class picker (the user, 2026-11-14: "maybe need a class picker on the left column with a select and
+    /// change class"): the eleven Cosmic jobs, three to a row. A click SELECTS - the Missions page shows that
+    /// class's missions, unlocks and scores, which the game keeps whatever job is on. The class the character
+    /// is on is in green. "Change to ..." puts the character on the picked class, through Hephaestus.
+    /// </summary>
+    private void DrawClassPicker()
+    {
+        if (Missions is not { Classes: { Count: > 0 } classes } view || view.CurrentJobId == 0)
+            return;
+
+        SeleneTheme.SectionLabel("Class");
+        var scale = ImGuiHelpers.GlobalScale;
+        var gap = 4f * scale;
+        var width = (ImGui.GetContentRegionAvail().X - (gap * 2f)) / 3f;
+        for (var i = 0; i < classes.Count; i++)
+        {
+            var (jobId, name) = classes[i];
+            if (i % 3 != 0)
+                ImGui.SameLine(0f, gap);
+
+            // Shown = filled in moonlight; the character's own = green letters.
+            using var fill = ImRaii.PushColor(ImGuiCol.Button, SeleneTheme.Moon with { W = 0.45f }, jobId == view.ClassJobId);
+            using var letters = ImRaii.PushColor(ImGuiCol.Text, SeleneTheme.StatusGreen, jobId == view.CurrentJobId);
+            if (ImGui.Button($"{name}##SeleneClass{jobId}", new Vector2(width, 0f)))
+            {
+                SelectClass?.Invoke(jobId);
+                _page = MainPage.Missions;
+            }
+        }
+
+        if (!view.OnThisClass)
+        {
+            ImGui.BeginDisabled(view.RunActive);
+            if (ImGui.Button($"Change to {view.JobName}", new Vector2(-1f, 0f)))
+                ChangeClass?.Invoke(view.ClassJobId);
+            ImGui.EndDisabled();
+            SeleneTheme.Tooltip("Puts the character on this class: Hephaestus equips its saved gearset. Not while a mission is in progress.");
+        }
+
+        if (!string.IsNullOrEmpty(view.ClassNote))
+            SeleneTheme.TextWrapped(view.ClassNote, SeleneTheme.TextMuted);
     }
 
     private void Tab(string label, FontAwesomeIcon icon, MainPage page)
@@ -378,7 +464,9 @@ public sealed class MainWindow : Window
 
     private void DrawMissions(MissionView? view)
     {
-        SeleneTheme.PageHeader("Missions", "The Master missions of the job you are on. Tick the ones Selene may run.");
+        // [SUPERSEDED 2026-11-14 by the tabs — the page listed the job's Master missions only]
+        // SeleneTheme.PageHeader("Missions", "The Master missions of the job you are on. Tick the ones Selene may run.");
+        SeleneTheme.PageHeader("Missions", "The missions of the job you are on, one kind to a tab. Tick the ones Selene may run.");
         // [SUPERSEDED 2026-11-12 by the attended run — the page could only read then]
         // SeleneTheme.TextWrapped(
         //     "Nothing is accepted, crafted or reported yet. This page reads the game and keeps your picks for when it is.",
@@ -408,30 +496,279 @@ public sealed class MainWindow : Window
         SeleneTheme.VSpace(4f);
         DrawRunControls(view);
 
-        if (!MissionInfo.IsCrafter(view.ClassJobId))
-        {
-            SeleneTheme.TextWrapped("Crafters only for now: change to a crafting job to see its Master missions.", SeleneTheme.TextSecondary);
-            return;
-        }
-
+        // [SUPERSEDED 2026-11-14 by the tabs — the user: "need to wire in the other missions, like ice does and
+        //  have tabs to seperate them". Every Cosmic job's missions are listed now, a kind to a tab.]
+        // if (!MissionInfo.IsCrafter(view.ClassJobId))
+        // {
+        //     SeleneTheme.TextWrapped("Crafters only for now: change to a crafting job to see its Master missions.", SeleneTheme.TextSecondary);
+        //     return;
+        // }
+        //
+        // if (view.Rows.Count == 0)
+        // {
+        //     SeleneTheme.TextWrapped("Neither the sheets nor the game name a Master mission for this job.", SeleneTheme.TextSecondary);
+        //     return;
+        // }
+        //
+        // SeleneTheme.SectionLabel($"Master missions · {view.JobName}");
+        // SeleneTheme.VSpace(2f);
+        // DrawMissionTable(view);
+        //
+        // // The sheets' Master flag was checked once against the game; say so if the two ever part again.
+        // if (view.State.InZone && view.Rows.Any(row => row.Offered && !row.Info.IsMaster))
+        // {
+        //     SeleneTheme.TextWrapped(
+        //         "The game offers a mission here that the sheets do not mark as Master: Selene's reading of the sheets is out of date. The row's tooltip shows what it found.",
+        //         SeleneTheme.Rose);
+        // }
+        // else if (view.State.InZone && view.State.OfferedMaster.Count > 0 && view.Rows.Any(row => !row.Offered && row.Info.IsMaster))
+        // {
+        //     SeleneTheme.TextWrapped(
+        //         "The sheets name a Master mission for this job that the game is not offering right now.",
+        //         SeleneTheme.TextMuted);
+        // }
         if (view.Rows.Count == 0)
         {
-            SeleneTheme.TextWrapped("Neither the sheets nor the game name a Master mission for this job.", SeleneTheme.TextSecondary);
+            SeleneTheme.TextWrapped("Neither the sheets nor the game name a mission for this job.", SeleneTheme.TextSecondary);
             return;
         }
 
-        SeleneTheme.SectionLabel($"Master missions · {view.JobName}");
-        SeleneTheme.VSpace(2f);
-        DrawMissionTable(view);
+        DrawUnlocks(view);
 
-        // The sheets' Master flag was checked once against the game; say so if the two ever part again.
-        if (view.State.InZone && view.Rows.Any(row => row.Offered && !row.Info.IsMaster))
+        SeleneTheme.SectionLabel($"Missions · {view.JobName}");
+        SeleneTheme.VSpace(2f);
+
+        // [SUPERSEDED 2026-11-14, the same day — the user: "need the mission seperated by moon". The kinds are
+        //  tabs INSIDE a star's tab now: DrawKindTabs.]
+        // using var tabs = ImRaii.TabBar("##SeleneMissionTabs");
+        // if (!tabs)
+        //     return;
+        //
+        // foreach (var category in MissionTabs)
+        // {
+        //     var rows = MissionBoard.In(view.Rows, category);
+        //     if (rows.Count == 0)
+        //         continue;
+        //
+        //     // "###" keeps the tab's identity while its label (the count, the mark) changes.
+        //     var mark = view.State.InZone && rows.Any(row => row.Offered) ? " •" : string.Empty;
+        //     using var tab = ImRaii.TabItem($"{TabName(category)} ({rows.Count}){mark}###SeleneMissionTab{category}");
+        //     if (!tab)
+        //         continue;
+        //
+        //     DrawMissionTab(view, category, rows);
+        // }
+        using var stars = ImRaii.TabBar("##SeleneMissionStars");
+        if (!stars)
+            return;
+
+        // A tab a star, in the order they were reached; "Other" last, for missions no star is known for.
+        // Arriving on a star (or logging in on one) brings its tab up once; after that the choice is the user's.
+        var here = view.State.InZone ? view.State.TerritoryId : 0u;
+        var arrived = here != 0 && here != _starShownFor;
+        foreach (var territory in MissionStars.Stars.Select(star => star.TerritoryId).Append(0u))
+        {
+            var onStar = MissionBoard.On(view.Rows, territory);
+            if (onStar.Count == 0)
+                continue;
+
+            var name = view.StarName?.Invoke(territory) ?? (territory == 0 ? "Other" : $"zone {territory}");
+            var label = $"{name}{(territory != 0 && territory == here ? " (here)" : string.Empty)}###SeleneStar{territory}";
+            using var star = ImRaii.TabItem(label, arrived && territory == here ? ImGuiTabItemFlags.SetSelected : ImGuiTabItemFlags.None);
+            if (star)
+                DrawKindTabs(view, onStar, territory);
+        }
+
+        _starShownFor = here;
+    }
+
+    /// <summary>
+    /// What the job's missions and actions want unlocked, against the character's quest log (the user,
+    /// 2026-11-14: "some mission require pre quests like unlocking collection and certain actions unlocked
+    /// from class quests ... check if we have them unlocked"). What is missing is said in rose; what is all
+    /// there, in one quiet line each.
+    /// </summary>
+    private static void DrawUnlocks(MissionView view)
+    {
+        SeleneTheme.SectionLabel($"Unlocks · {view.JobName}");
+        SeleneTheme.VSpace(2f);
+
+        if (view.QuestsDone is not { } done)
+        {
+            SeleneTheme.TextWrapped("The quest log has not been read yet.", SeleneTheme.TextMuted);
+            SeleneTheme.VSpace(4f);
+            return;
+        }
+
+        // The quests the missions themselves ask for (the game's own list, a mission's WKSFunction).
+        var asked = view.Rows.SelectMany(row => row.Info.Needs ?? Array.Empty<QuestNeed>()).GroupBy(need => need.QuestId).ToList();
+        var locked = false;
+        foreach (var quest in asked.Where(quest => !done.Contains(quest.Key)))
+        {
+            locked = true;
+            var missions = view.Rows.Count(row => row.Missing?.Any(need => need.QuestId == quest.Key) == true);
+            SeleneTheme.TextWrapped($"{missions} mission(s) are LOCKED: the quest \"{quest.First().QuestName}\" is not done.", SeleneTheme.Rose);
+        }
+
+        if (!locked)
         {
             SeleneTheme.TextWrapped(
-                "The game offers a mission here that the sheets do not mark as Master: Selene's reading of the sheets is out of date. The row's tooltip shows what it found.",
+                asked.Count == 0
+                    ? "None of this job's missions asks for a quest."
+                    : $"Every quest this job's missions ask for is done: {string.Join(", ", asked.Select(quest => $"\"{quest.First().QuestName}\""))}.",
+                SeleneTheme.TextSecondary);
+        }
+
+        // The job's actions that a quest unlocks.
+        var unlocks = view.JobUnlocks ?? Array.Empty<ActionNeed>();
+        var missing = unlocks.Where(unlock => !done.Contains(unlock.QuestId)).GroupBy(unlock => unlock.QuestId).ToList();
+        foreach (var quest in missing)
+        {
+            // [SUPERSEDED 2026-11-14 — first seen in game on a Fisher: three rose lines, eleven spearfishing actions
+            //  among them, for things that lock NO mission. Rose is kept for what locks a mission; this is amber.]
+            // SeleneTheme.TextWrapped(
+            //     $"NOT LEARNED: {string.Join(", ", quest.Select(unlock => $"{unlock.Action} (level {unlock.Level})"))} — the quest \"{quest.First().QuestName}\" is not done.",
+            //     SeleneTheme.Rose);
+            SeleneTheme.TextWrapped(
+                $"Not learned: {string.Join(", ", quest.Select(unlock => $"{unlock.Action} (level {unlock.Level})"))} — the quest \"{quest.First().QuestName}\" is not done. No mission is locked by it.",
+                SeleneTheme.Amber);
+        }
+
+        if (missing.Count == 0 && unlocks.Count > 0)
+        {
+            SeleneTheme.TextWrapped(
+                $"Every action of this job that a quest unlocks is unlocked: {string.Join(", ", unlocks.Select(unlock => unlock.Action))}.",
+                SeleneTheme.TextSecondary);
+            SeleneTheme.Tooltip("By the quest log: the quest behind each action is done. The job's LEVEL is not checked here, and a specialist action also needs the specialist's soul.");
+        }
+
+        SeleneTheme.VSpace(4f);
+    }
+
+    /// <summary>The star whose tab was last brought up by itself: the one the character was on.</summary>
+    private uint _starShownFor;
+
+    /// <summary>One star's missions, a kind to a tab.</summary>
+    private void DrawKindTabs(MissionView view, IReadOnlyList<MissionRow> onStar, uint territory)
+    {
+        using var tabs = ImRaii.TabBar($"##SeleneMissionTabs{territory}");
+        if (!tabs)
+            return;
+
+        foreach (var category in MissionTabs)
+        {
+            var rows = MissionBoard.In(onStar, category);
+            if (rows.Count == 0)
+                continue;
+
+            // "###" keeps the tab's identity while its label (the count, the mark) changes.
+            var mark = view.State.InZone && rows.Any(row => row.Offered) ? " •" : string.Empty;
+            using var tab = ImRaii.TabItem($"{TabName(category)} ({rows.Count}){mark}###SeleneMissionTab{territory}_{category}");
+            if (!tab)
+                continue;
+
+            DrawMissionTab(view, category, rows);
+        }
+    }
+
+    /// <summary>The tabs, in the order drawn: what Selene runs first, then the ranks, then the special kinds.</summary>
+    private static readonly MissionCategory[] MissionTabs =
+    {
+        MissionCategory.Master, MissionCategory.RankA, MissionCategory.RankB, MissionCategory.RankC, MissionCategory.RankD,
+        MissionCategory.Sequence, MissionCategory.Weather, MissionCategory.Timed, MissionCategory.RedAlert,
+    };
+
+    /// <summary>The game's rank number as a word; a number it has no name for (a Master mission's) is shown as it is.</summary>
+    private static string RankName(int rank) => rank switch
+    {
+        0 => "no rank",
+        1 => "bronze",
+        2 => "silver",
+        3 => "gold",
+        _ => $"rank {rank}",
+    };
+
+    private static string TabName(MissionCategory category) => category switch
+    {
+        MissionCategory.Master => "Master",
+        MissionCategory.RankA => "A / EX",
+        MissionCategory.RankB => "B",
+        MissionCategory.RankC => "C",
+        MissionCategory.RankD => "D",
+        MissionCategory.Sequence => "Sequence",
+        MissionCategory.Weather => "Weather",
+        MissionCategory.Timed => "Timed",
+        _ => "Red Alert",
+    };
+
+    /// <summary>One tab: what can be said of the kind, then its missions - what the game holds first.</summary>
+    private void DrawMissionTab(MissionView view, MissionCategory category, IReadOnlyList<MissionRow> rows)
+    {
+        // [SUPERSEDED 2026-11-14, the same day — the user: "should be all missions"; only red alerts and the
+        //  gatherers' missions are not run now]
+        // var runs = category == MissionCategory.Master && MissionInfo.IsCrafter(view.ClassJobId);
+        // if (!runs)
+        // {
+        //     SeleneTheme.TextWrapped(
+        //         MissionInfo.IsCrafter(view.ClassJobId)
+        //             ? "Listed, and your ticks are kept - but Selene runs only Master missions so far. Nothing on this tab is accepted or run yet."
+        //             : "Listed, and your ticks are kept - but Selene runs only crafting missions so far. Gathering and fishing wait on Demeter.",
+        //         SeleneTheme.Amber);
+        //     SeleneTheme.VSpace(2f);
+        // }
+        var crafter = MissionInfo.IsCrafter(view.ClassJobId);
+        if (!crafter)
+        {
+            SeleneTheme.TextWrapped("Listed, and your ticks are kept - but gathering and fishing missions are not run yet: they wait on Demeter.", SeleneTheme.Amber);
+        }
+        else if (category == MissionCategory.RedAlert)
+        {
+            SeleneTheme.TextWrapped("Listed, and your ticks are kept - but a red alert is not run yet: it ends with a walk to a hand-in point, which Selene cannot do.", SeleneTheme.Amber);
+        }
+        else
+        {
+            if (category != MissionCategory.Master)
+            {
+                SeleneTheme.TextWrapped(
+                    "Built, never run: these missions are reported at the rank chosen beside Run, and one of several recipes is crafted recipe by recipe. Stay and watch the first ones.",
+                    SeleneTheme.Amber);
+            }
+
+            var whole = view.WholeTabs?.Contains(category) ?? false;
+            if (ImGui.Checkbox($"Run whatever the game offers on this tab##whole{category}", ref whole))
+                SetWholeTab?.Invoke(category, whole);
+            SeleneTheme.Tooltip("Run then takes any mission of this kind the game holds, ticked or not - instead of re-rolling for a ticked one.");
+        }
+
+        SeleneTheme.VSpace(2f);
+
+        // How far the tab is, by the game's mission log (the count a "gold all" would work down).
+        if (category == MissionCategory.Master)
+        {
+            // No stars on a Master mission: the Best column is its high score.
+        }
+        else if (rows.Count > 0 && rows[0].Best != null)
+        {
+            var gold = rows.Count(row => row.Best == MissionBest.Gold);
+            SeleneTheme.Text(
+                gold == rows.Count ? $"Gold on all {rows.Count}." : $"Gold on {gold} of {rows.Count}.",
+                gold == rows.Count ? SeleneTheme.Amber : SeleneTheme.TextSecondary);
+        }
+
+        // OrderBy is stable: the mission in progress, then what the game holds, each in id order.
+        DrawMissionTable(view, rows.OrderByDescending(row => row.Current).ThenByDescending(row => row.Offered).ToList());
+
+        if (category != MissionCategory.Master || !view.State.InZone)
+            return;
+
+        // The sheets' Master flag was checked once against the game; say so if the two ever part again.
+        if (view.State.OfferedMaster.Any(id => view.Rows.Any(row => row.Info.Id == id && !row.Info.IsMaster)))
+        {
+            SeleneTheme.TextWrapped(
+                "The game offers a Master mission that the sheets do not mark as one: Selene's reading of the sheets is out of date. Look for it on the other tabs.",
                 SeleneTheme.Rose);
         }
-        else if (view.State.InZone && view.State.OfferedMaster.Count > 0 && view.Rows.Any(row => !row.Offered && row.Info.IsMaster))
+        else if (view.State.OfferedMaster.Count > 0 && rows.Any(row => !row.Offered))
         {
             SeleneTheme.TextWrapped(
                 "The sheets name a Master mission for this job that the game is not offering right now.",
@@ -451,13 +788,47 @@ public sealed class MainWindow : Window
         // ImGui.EndDisabled();
         // if (!view.RunActive && !view.State.InMission)
         //     SeleneTheme.Tooltip("Accept a mission first.");
-        var canAccept = view.Rows.Any(row => row.Picked && row.Offered);
+        // [SUPERSEDED 2026-11-14 — every kind is listed and can be ticked now; Run takes Master crafting missions only]
+        // var canAccept = view.Rows.Any(row => row.Picked && row.Offered);
+        // [SUPERSEDED 2026-11-14, the same day — the plugin says what Run would take, now that most kinds run]
+        // var canAccept = MissionInfo.IsCrafter(view.ClassJobId)
+        //                 && view.Rows.Any(row => row.Picked && row.Offered && row.Info.IsMaster);
+        // Another class is being looked at: nothing of it can be run from here.
+        if (!view.OnThisClass)
+        {
+            SeleneTheme.TextWrapped(
+                $"Showing {view.JobName}, which the character is not on. Use \"Change to {view.JobName}\" in the left column to run its missions.",
+                SeleneTheme.Amber);
+            if (view.RunActive)
+                SeleneTheme.TextWrapped(view.RunStatus, SeleneTheme.StatusGreen);
+            SeleneTheme.VSpace(4f);
+            return;
+        }
+
+        var canAccept = view.CanAccept;
         ImGui.BeginDisabled(view.RunActive || (!view.State.InMission && !canAccept));
         if (ImGui.Button(view.State.InMission ? "Run this mission" : "Run a ticked mission", new Vector2(170f * scale, 0f)))
             _startRun();
         ImGui.EndDisabled();
         if (!view.RunActive && !view.State.InMission && !canAccept)
-            SeleneTheme.Tooltip("Tick a mission the game is offering first.");
+            SeleneTheme.Tooltip("Tick a crafting mission the game is offering first, or tick a whole tab. Red alerts and gathering or fishing missions are not run yet.");
+
+        // The goal for every mission that is not a Master one (those are played to the clock).
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(90f * scale);
+        using (var goal = ImRaii.Combo("##SeleneReportGoal", view.ReportGoal.ToString()))
+        {
+            if (goal)
+            {
+                foreach (var rank in new[] { MissionRank.Gold, MissionRank.Silver, MissionRank.Bronze })
+                {
+                    if (ImGui.Selectable(rank.ToString(), rank == view.ReportGoal))
+                        SetReportGoal?.Invoke(rank);
+                }
+            }
+        }
+
+        SeleneTheme.Tooltip("Report a ranked mission as soon as it reads this rank. If the materials run out first, what was made is reported. Master missions do not use it.");
 
         ImGui.SameLine();
         ImGui.BeginDisabled(!view.RunActive);
@@ -504,9 +875,16 @@ public sealed class MainWindow : Window
                 : "This Hephaestus does not report its gear gate (the fields were added on 2026-11-12). Selene will accept no mission while it cannot tell.");
     }
 
-    private void DrawMissionTable(MissionView view)
+    private void DrawMissionTable(MissionView view, IReadOnlyList<MissionRow> rows)
     {
-        using var table = ImRaii.Table("##SeleneMissions", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV);
+        // [SUPERSEDED 2026-11-14 — a sixth column: what the mission pays towards the cosmic tool]
+        // using var table = ImRaii.Table("##SeleneMissions", 5, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV);
+        // [SUPERSEDED 2026-11-14, the same day — a seventh: the best done on it (the user: "need a column to see if
+        //  they have gotten gold yet")]
+        // using var table = ImRaii.Table("##SeleneMissions", 6, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV);
+        // [SUPERSEDED 2026-11-14, the same day — an eighth: the class points measured]
+        // using var table = ImRaii.Table("##SeleneMissions", 7, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV);
+        using var table = ImRaii.Table("##SeleneMissions", 8, ImGuiTableFlags.RowBg | ImGuiTableFlags.BordersInnerV);
         if (!table)
             return;
 
@@ -515,10 +893,13 @@ public sealed class MainWindow : Window
         ImGui.TableSetupColumn("Mission", ImGuiTableColumnFlags.WidthStretch);
         ImGui.TableSetupColumn("Clock", ImGuiTableColumnFlags.WidthFixed, 50f * scale);
         ImGui.TableSetupColumn("Silver / gold", ImGuiTableColumnFlags.WidthFixed, 110f * scale);
+        ImGui.TableSetupColumn("Best", ImGuiTableColumnFlags.WidthFixed, 56f * scale);
+        ImGui.TableSetupColumn("Class pts", ImGuiTableColumnFlags.WidthFixed, 70f * scale);
+        ImGui.TableSetupColumn("Tool data", ImGuiTableColumnFlags.WidthFixed, 140f * scale);
         ImGui.TableSetupColumn("On the board", ImGuiTableColumnFlags.WidthFixed, 100f * scale);
         ImGui.TableHeadersRow();
 
-        foreach (var row in view.Rows)
+        foreach (var row in rows)
         {
             var info = row.Info;
             ImGui.TableNextRow();
@@ -529,8 +910,14 @@ public sealed class MainWindow : Window
                 _pickMission(info.Id, picked);
 
             ImGui.TableNextColumn();
-            SeleneTheme.Text(info.Name, row.Picked ? SeleneTheme.TextPrimary : SeleneTheme.TextSecondary);
-            SeleneTheme.Tooltip($"Mission {info.Id} · tier {info.LevelGroup}{(info.IsMaster ? " · Master" : " · not Master")} · recipes {(info.RecipeIds.Count == 0 ? "none" : string.Join(", ", info.RecipeIds))}");
+            // [SUPERSEDED 2026-11-14 — a mission a quest keeps locked is drawn in rose, and its tooltip says which quest]
+            // SeleneTheme.Text(info.Name, row.Picked ? SeleneTheme.TextPrimary : SeleneTheme.TextSecondary);
+            // SeleneTheme.Tooltip($"Mission {info.Id} · {TabName(info.Category)} · tier {info.LevelGroup} · recipes {(info.RecipeIds.Count == 0 ? "none" : string.Join(", ", info.RecipeIds))}");
+            SeleneTheme.Text(info.Name, row.Locked ? SeleneTheme.Rose : row.Picked ? SeleneTheme.TextPrimary : SeleneTheme.TextSecondary);
+            SeleneTheme.Tooltip(
+                $"Mission {info.Id} · {TabName(info.Category)} · tier {info.LevelGroup} · recipes {(info.RecipeIds.Count == 0 ? "none" : string.Join(", ", info.RecipeIds))}"
+                + (info.Needs is { Count: > 0 } needs ? $" · needs the quest {string.Join(" and ", needs.Select(need => $"\"{need.QuestName}\""))}" : string.Empty)
+                + (row.Locked ? $" — NOT DONE: {string.Join(", ", row.Missing!.Select(need => $"\"{need.QuestName}\""))}" : string.Empty));
 
             ImGui.TableNextColumn();
             SeleneTheme.Text(info.TimeLimitSeconds > 0 ? $"{info.TimeLimitSeconds / 60}:{info.TimeLimitSeconds % 60:00}" : "untimed", SeleneTheme.TextDim);
@@ -540,8 +927,80 @@ public sealed class MainWindow : Window
                 $"{info.SilverScore.ToString("N0", CultureInfo.InvariantCulture)} / {info.GoldScore.ToString("N0", CultureInfo.InvariantCulture)}",
                 SeleneTheme.TextDim);
 
+            // The best done on it. A Master mission has no star: its best is the highest score the game keeps.
             ImGui.TableNextColumn();
-            if (!view.State.InZone)
+            if (info.IsMaster)
+            {
+                SeleneTheme.Text(
+                    row.HighScore is not { } high ? "?" : high == 0 ? "—" : high.ToString("N0", CultureInfo.InvariantCulture),
+                    row.HighScore is > 0 ? SeleneTheme.Amber : SeleneTheme.TextMuted);
+                SeleneTheme.Tooltip(row.HighScore == null
+                    ? "The game holds a high score only for the Master missions it is offering, in a Cosmic Exploration zone."
+                    : "The highest score on this Master mission, as the game keeps it. Read from a field of the game's state that has no name yet: compare it with the High Score on the game's Tool Mastery tab.");
+            }
+            else
+            switch (row.Best)
+            {
+                case MissionBest.Gold: SeleneTheme.Text("gold", SeleneTheme.Amber); break;
+                case MissionBest.Completed: SeleneTheme.Text("done", SeleneTheme.TextSecondary); break;
+                case MissionBest.None: SeleneTheme.Text("—", SeleneTheme.TextMuted); break;
+                default: SeleneTheme.Text("?", SeleneTheme.TextMuted); break;
+            }
+
+            if (!info.IsMaster)
+            SeleneTheme.Tooltip(row.Best switch
+            {
+                MissionBest.Gold => "Completed with a gold star, by the game's mission log.",
+                MissionBest.Completed => "Completed, but not yet with a gold star.",
+                MissionBest.None => "Never completed.",
+                _ => "The game's mission log can only be read in a Cosmic Exploration zone.",
+            });
+
+            // The class points it was MEASURED to pay (they are in none of the game's sheets): the latest at the
+            // best rank seen. Blank until one has been watched to its end.
+            ImGui.TableNextColumn();
+            if (row.Payout is not { } payout)
+            {
+                SeleneTheme.Text("—", SeleneTheme.TextMuted);
+                SeleneTheme.Tooltip("Not measured yet: Selene notes the class score before and after a mission, whoever runs it.");
+            }
+            else
+            {
+                var (bestRank, bestPoints) = payout.Best;
+                SeleneTheme.Text(bestPoints.ToString("N0", CultureInfo.InvariantCulture), SeleneTheme.TextPrimary);
+                SeleneTheme.Tooltip(
+                    $"Measured {payout.Samples} time(s). "
+                    + string.Join(" · ", payout.ByRank.OrderByDescending(rank => rank.Key).Select(rank =>
+                        $"{RankName(rank.Key)}: {rank.Value.Last:N0}"
+                        + (rank.Value.Min != rank.Value.Max ? $" (from {rank.Value.Min:N0} to {rank.Value.Max:N0})" : string.Empty)
+                        + $" x{rank.Value.Count}"))
+                    + (payout.PerMinute is { } perMinute
+                        ? $" · about {payout.AverageSeconds / 60}:{payout.AverageSeconds % 60:00} a mission, {perMinute:N0} a minute at {RankName(bestRank)}"
+                        : " · not timed yet"));
+            }
+
+            // What it pays towards the job's cosmic tool; the rest of the payout is in the tooltip.
+            ImGui.TableNextColumn();
+            if (info.Reward is not { } reward)
+            {
+                SeleneTheme.Text("?", SeleneTheme.TextMuted);
+            }
+            else
+            {
+                var data = reward.ToolDataText;
+                SeleneTheme.Text(
+                    data.Length > 0 ? data : reward.Tokens > 0 ? $"{reward.Tokens} tokens" : "none",
+                    data.Length > 0 ? SeleneTheme.TextPrimary : SeleneTheme.TextDim);
+                SeleneTheme.Tooltip(
+                    $"The sheets' base figures (what a rank adds is not in them). Tool data: {(data.Length > 0 ? data : "none")} · "
+                    + $"Cosmocredits {reward.CosmoCredits} · star credits {reward.PlanetCredits}"
+                    + (reward.Tokens > 0 ? $" · exploration tokens {reward.Tokens}" : string.Empty));
+            }
+
+            ImGui.TableNextColumn();
+            if (row.Locked)
+                SeleneTheme.Text("locked", SeleneTheme.Rose);
+            else if (!view.State.InZone)
                 SeleneTheme.Text("not in zone", SeleneTheme.TextMuted);
             else if (row.Current)
                 SeleneTheme.Text("in progress", SeleneTheme.StatusGreen);
@@ -606,6 +1065,41 @@ public sealed class MainWindow : Window
             SeleneTheme.Text(service, SeleneTheme.TextDim);
             ImGui.SameLine(110f * ImGuiHelpers.GlobalScale);
             SeleneTheme.TextWrapped(status, SeleneTheme.TextPrimary);
+        }
+
+        // A look only: the "Water" and "Shore" lines above say what it found. Nothing moves.
+        if (LookForWater != null)
+        {
+            ImGui.Spacing();
+            if (ImGui.Button("Look for water here"))
+                LookForWater();
+            SeleneTheme.Tooltip("Also draws what it found over the game: blue dots = water, amber dots = places at the edge, a green ring with a line = the place chosen and the way it would face.");
+
+            if (HideWaterMarks != null)
+            {
+                ImGui.SameLine();
+                if (ImGui.Button("Hide the markers"))
+                    HideWaterMarks();
+            }
+        }
+
+        if (ExportPayouts != null)
+        {
+            if (ImGui.Button("Export payouts as a sheet"))
+                ExportPayouts();
+            SeleneTheme.Tooltip("Writes every measured mission payout to payouts.csv; the \"Payouts\" line above says where.");
+        }
+
+        // The walk test. THIS MOVES THE CHARACTER - the only thing on this page that does.
+        if (WalkToSpot != null && StopWalk != null)
+        {
+            if (ImGui.Button("Walk to the chosen spot"))
+                WalkToSpot();
+            SeleneTheme.Tooltip("MOVES YOUR CHARACTER: Ariadne walks it to the green ring and it turns to the water. The mesh is asked first, so a place that cannot be reached is refused before a step is taken. The \"Walk\" line above says how it went.");
+
+            ImGui.SameLine();
+            if (ImGui.Button("Stop walking"))
+                StopWalk();
         }
     }
 

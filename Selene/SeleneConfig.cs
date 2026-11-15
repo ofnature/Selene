@@ -14,6 +14,18 @@ public sealed class CharacterSettings
     /// may ever accept. Picked by hand - Selene never adds to it.
     /// </summary>
     public List<uint> PickedMissions { get; set; } = new();
+
+    /// <summary>
+    /// The tabs ticked as a whole ("run whatever the game offers of this kind" - the user, 2026-11-14, instead
+    /// of re-rolling for a ticked mission): Selene may run any mission of these kinds that the game holds.
+    /// </summary>
+    public List<Features.Missions.MissionCategory> WholeTabs { get; set; } = new();
+
+    /// <summary>
+    /// The rank at which a ranked mission is reported (the user, 2026-11-14: "a setting"). Master missions do
+    /// not use it: they are played to the clock.
+    /// </summary>
+    public Features.Missions.MissionRank ReportGoal { get; set; } = Features.Missions.MissionRank.Gold;
 }
 
 /// <summary>

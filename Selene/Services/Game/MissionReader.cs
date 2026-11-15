@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using FFXIVClientStructs.FFXIV.Client.Game;
 using FFXIVClientStructs.FFXIV.Client.Game.UI;
 using FFXIVClientStructs.FFXIV.Client.Game.WKS;
 using FFXIVClientStructs.FFXIV.Client.System.Framework;
@@ -18,24 +19,50 @@ public sealed unsafe class MissionReader
     /// <summary>The game keeps one block of mission state per Cosmic job, 11 of them: Carpenter (8) to Fisher (18).</summary>
     private const uint FirstCosmicJob = 8;
 
+    /// <summary>Where a Master mission's state keeps the number taken to be its high score.</summary>
+    private const int MasterHighScoreOffset = 12;
+
     /// <summary>What was read last, or why nothing was.</summary>
     public string Status { get; private set; } = "Idle — nothing read yet.";
 
-    public MissionState Read(uint classJobId)
+    /// <param name="missionIds">
+    /// The missions to ask the game's mission log about (completed, and completed with gold): the job's own.
+    /// Null = not asked.
+    /// </param>
+    /// <param name="questIds">
+    /// The quests to ask the game about (done or not): the ones the job's missions and actions want. Read in
+    /// ANY zone - a quest is the character's, not the zone's. Null = not asked.
+    /// </param>
+    public MissionState Read(uint classJobId, IReadOnlyCollection<uint>? missionIds = null, IReadOnlyCollection<uint>? questIds = null)
     {
+        HashSet<uint>? questsDone = null;
         try
         {
+            // The quest log first: it does not need a Cosmic zone. (Quest ids are 65536 + the game's own number.)
+            if (questIds != null && QuestManager.Instance() != null)
+            {
+                questsDone = new HashSet<uint>();
+                foreach (var quest in questIds)
+                {
+                    if (QuestManager.IsQuestComplete((ushort)(quest & 0xFFFF)))
+                        questsDone.Add(quest);
+                }
+            }
+
             var manager = WKSManager.Instance();
             if (manager == null || !manager->IsLoaded)
             {
-                Status = "Idle — not in a Cosmic Exploration zone.";
-                return MissionState.NotInZone(classJobId);
+                Status = "Idle — not in a Cosmic Exploration zone."
+                         + (questsDone == null ? string.Empty : $" Quests asked about: {questIds!.Count}, done: {questsDone.Count}.");
+                return MissionState.NotInZone(classJobId) with { QuestsDone = questsDone };
             }
 
             ref var state = ref manager->State;
             var current = state.CurrentMission;
 
             var offered = new List<uint>();
+            var masterBest = new Dictionary<uint, uint>();
+            var other = new List<uint>();
             uint bonus = 0;
             var classScore = 0;
             var jobs = state.JobStates;
@@ -46,31 +73,99 @@ public sealed unsafe class MissionReader
                 ref var job = ref jobs[index];
                 foreach (ref var master in job.MasterMissions)
                 {
-                    if (master.MissionUnitId != 0)
-                        offered.Add(master.MissionUnitId);
+                    if (master.MissionUnitId == 0)
+                        continue;
+
+                    offered.Add(master.MissionUnitId);
+
+                    // The one field a Master mission's state has over a ranked one's: four bytes at +12, private
+                    // and unnamed in ClientStructs ("UnkC"). TAKEN TO BE THE HIGH SCORE the Tool Mastery tab
+                    // shows - unseen in game when written (2026-11-14); the Status lists it, so a wrong guess shows.
+                    fixed (WKSManager.WKSMasterMissionState* raw = &master)
+                        masterBest[master.MissionUnitId] = *(uint*)((byte*)raw + MasterHighScoreOffset);
                 }
 
                 bonus = job.BonusMasterMissionUnitId;
                 classScore = state.Scores[index];
+
+                // The job's other lists, as ClientStructs names them: four ranks of three, one extra ranked
+                // mission, and the sequence / provisional / red-alert lists. UNSEEN IN GAME when written
+                // (2026-11-14): that they are what the board's other tabs show.
+                foreach (ref var rank in job.MissionClasses)
+                {
+                    foreach (ref var mission in rank.Missions)
+                        Add(other, mission.MissionUnitId);
+                }
+
+                Add(other, job.ExtraBasicMission.MissionUnitId);
+                for (var i = 0; i < job.SequentialMissions.Count; i++)
+                    Add(other, job.SequentialMissions[i].MissionUnitId);
+                for (var i = 0; i < job.ProvisionalMissions.Count; i++)
+                    Add(other, job.ProvisionalMissions[i].MissionUnitId);
+                for (var i = 0; i < job.CriticalMissions.Count; i++)
+                    Add(other, job.CriticalMissions[i].MissionUnitId);
             }
 
             var clock = current.MissionUnitRowId != 0 ? ReadClock(out var clockDetail) : NoClock(out clockDetail);
 
+            // The game's mission log, mission by mission (ClientStructs' own helpers over the two flag arrays;
+            // ICE's gold mode reads the same). UNSEEN IN GAME when written (2026-11-14).
+            HashSet<uint>? completed = null, golded = null;
+            if (missionIds != null)
+            {
+                completed = new HashSet<uint>();
+                golded = new HashSet<uint>();
+                foreach (var id in missionIds)
+                {
+                    if (manager->IsMissionGolded(id))
+                        golded.Add(id);
+                    if (manager->IsMissionCompleted(id))
+                        completed.Add(id);
+                }
+            }
+
             Status = $"zone {manager->TerritoryId} · job {classJobId} = state block {(hasJob ? index.ToString() : "none")}"
-                     + $" · Master offered: {(offered.Count == 0 ? "none" : string.Join(", ", offered))} (bonus {bonus})"
+                     + $" · Master offered: {(offered.Count == 0 ? "none" : string.Join(", ", offered.ConvertAll(id => $"{id} [+12 = {masterBest[id]}]")))} (bonus {bonus})"
+                     + $" · other missions held: {(other.Count == 0 ? "none" : string.Join(", ", other))}"
+                     + (golded == null ? string.Empty : $" · of the job's {missionIds!.Count} missions: {completed!.Count} completed, {golded.Count} gold")
+                     + (questsDone == null ? string.Empty : $" · quests asked about: {questIds!.Count}, done: {questsDone.Count}")
                      + $" · current mission {current.MissionUnitRowId}, score {current.ScoreUInt}, rank {(int)current.Rank}"
                      + $" · class score {classScore} · clock: {clockDetail}";
 
             return new MissionState(
                 true, manager->TerritoryId, classJobId, current.MissionUnitRowId, current.ScoreUInt,
                 Enum.IsDefined(typeof(MissionRank), (int)current.Rank) ? (MissionRank)(int)current.Rank : MissionRank.None,
-                offered, bonus, classScore, clock);
+                offered, bonus, classScore, clock, other, completed, golded, questsDone, masterBest, state.ConsecutiveGoldCount);
         }
         catch (Exception ex)
         {
             Status = $"The mission state could not be read — {ex.Message}";
-            return MissionState.NotInZone(classJobId);
+            return MissionState.NotInZone(classJobId) with { QuestsDone = questsDone };
         }
+    }
+
+    /// <summary>
+    /// How many of an item the character holds - for the job's tool mastery points, which the game keeps as
+    /// an item count (ICE's reading; the item is <c>WKSScoreList[job - 8].Unknown5</c>). Asked only when a
+    /// mission starts and ends, never on a timer. Null when it cannot be read.
+    /// </summary>
+    public int? ItemCount(uint itemId)
+    {
+        try
+        {
+            var bags = InventoryManager.Instance();
+            return itemId == 0 || bags == null ? null : bags->GetInventoryItemCount(itemId);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static void Add(List<uint> ids, uint id)
+    {
+        if (id != 0 && !ids.Contains(id))
+            ids.Add(id);
     }
 
     private static int? NoClock(out string detail)

@@ -41,6 +41,11 @@ public sealed unsafe class MissionWindows
     /// </summary>
     private const uint MasteryTabButton = 20;
 
+    /// <summary>The board's other tabs, by ECommons' numbers. Unpressed in game.</summary>
+    private const uint BasicTabButton = 17;
+    private const uint ProvisionalTabButton = 18;
+    private const uint CriticalTabButton = 19;
+
     private const uint LogButton = 35;
 
     /// <summary>
@@ -97,7 +102,35 @@ public sealed unsafe class MissionWindows
 
     public void OpenBoard() => Press(Hud, HudMissionsButton, "Open the board");
 
-    public void ShowMasteryTab() => Press(Board, MasteryTabButton, "Tool Mastery tab");
+    // [SUPERSEDED 2026-11-14 by ShowTab — the other kinds of mission sit on the board's other tabs]
+    // public void ShowMasteryTab() => Press(Board, MasteryTabButton, "Tool Mastery tab");
+
+    /// <summary>
+    /// Bring up the board tab a kind of mission is on. ECommons' numbers: 17 basic (the ranked missions),
+    /// 18 provisional (weather, hour and sequence missions - THAT THE SEQUENCE ONES ARE THERE IS AN
+    /// ASSUMPTION), 19 critical (red alerts); 20 for Tool Mastery is the guess it always was.
+    /// NONE OF THE FOUR HAS BEEN PRESSED IN GAME: the board has so far always opened on the right tab.
+    /// </summary>
+    public void ShowTab(Features.Missions.MissionCategory category)
+    {
+        switch (category)
+        {
+            case Features.Missions.MissionCategory.Master:
+                Press(Board, MasteryTabButton, "Tool Mastery tab");
+                break;
+            case Features.Missions.MissionCategory.RedAlert:
+                Press(Board, CriticalTabButton, "Critical tab");
+                break;
+            case Features.Missions.MissionCategory.Sequence:
+            case Features.Missions.MissionCategory.Weather:
+            case Features.Missions.MissionCategory.Timed:
+                Press(Board, ProvisionalTabButton, "Provisional tab");
+                break;
+            default:
+                Press(Board, BasicTabButton, "Basic missions tab");
+                break;
+        }
+    }
 
     /// <summary>Select the mission's row: what a click on it sends.</summary>
     public void Select(uint missionId) => BoardCallback(BoardSelectCallback, missionId, "Select", mustBeSelected: false);
