@@ -70,7 +70,7 @@ Add this custom plugin repository in Dalamud's settings (Experimental → Custom
 Repositories), then install Selene from the plugin installer:
 
 ```
-https://raw.githubusercontent.com/ofnature/Selene/main/repo.json
+https://raw.githubusercontent.com/ofnature/Daedalus/main/repo.json
 ```
 
 Selene needs Hephaestus to run a crafting mission, Lifestream for the trip to a star and Ariadne
