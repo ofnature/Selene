@@ -54,6 +54,13 @@ public sealed unsafe class MissionWindows
     /// </summary>
     private const uint ReportButton = 37;
 
+    /// <summary>
+    /// Abandon, Report's neighbour (ECommons' number; the user's screenshot has the five buttons in that
+    /// order). Pressed for ONE purpose - a re-roll (2026-11-14) - and only when its label IS the game's own
+    /// word for it.
+    /// </summary>
+    private const uint AbandonButton = 38;
+
     // The board's values (ECommons' AddonMaster.WKSMission).
     private const int BoardRowCount = 33;
     private const int BoardFirstRow = 36;
@@ -66,10 +73,22 @@ public sealed unsafe class MissionWindows
     private const int LogSelectCallback = 0;
 
     private readonly IGameGui _gameGui;
+    private readonly string _abandonLabel;
+    private readonly string _abandonQuestion;
 
-    public MissionWindows(IGameGui gameGui)
+    // [SUPERSEDED 2026-11-14 — the abandon button's word and the abandon question come from the game's text]
+    // public MissionWindows(IGameGui gameGui)
+    // {
+    //     _gameGui = gameGui;
+    // }
+
+    /// <param name="abandonLabel">The game's word on the Abandon button (Addon 16798, "Abandon"), in the client's language.</param>
+    /// <param name="abandonQuestion">The game's abandon question (Addon 16965, "Abandon mission?").</param>
+    public MissionWindows(IGameGui gameGui, string abandonLabel = "Abandon", string abandonQuestion = "Abandon mission?")
     {
         _gameGui = gameGui;
+        _abandonLabel = abandonLabel.Trim().Length > 0 ? abandonLabel.Trim() : "Abandon";
+        _abandonQuestion = abandonQuestion.Trim().Length > 0 ? abandonQuestion.Trim() : "Abandon mission?";
     }
 
     /// <summary>What was pressed last, or why nothing was.</summary>
@@ -250,6 +269,84 @@ public sealed unsafe class MissionWindows
             Press(MissionInProgress, ReportButton, "Report", never: "Abandon");
     }
 
+    /// <summary>What was found the last time the game was asked whether it is asking to abandon.</summary>
+    public string AbandonDetail { get; private set; } = "no question on screen";
+
+    /// <summary>
+    /// Press Abandon - for a re-roll, on a mission Selene accepted a moment ago to throw away (the caller's
+    /// business; nothing here knows why). Mission in Progress is brought up first if it is not on screen.
+    /// The button is pressed only when its label IS the game's own word for abandoning: a changed layout
+    /// presses nothing. NOT SEEN IN GAME when written (2026-11-14).
+    /// </summary>
+    public void Abandon()
+    {
+        if (Window(MissionInProgress) == null)
+            Press(Hud, HudMissionsButton, "Open Mission in Progress (to abandon)");
+        else
+            Press(MissionInProgress, AbandonButton, "Abandon", must: _abandonLabel);
+    }
+
+    /// <summary>
+    /// The game is asking "Abandon mission?" right now. Told by the question's own text (the Addon sheet's,
+    /// in the client's language): the window opens with it, with a warning line after it when there is a
+    /// gold count to lose ("Abandoning this mission will reset your gold count."). Any other yes/no is not it.
+    /// </summary>
+    public bool AbandonAsked()
+    {
+        try
+        {
+            var yesNo = Window(YesNo);
+            if (yesNo == null)
+            {
+                AbandonDetail = "no question on screen";
+                return false;
+            }
+
+            var asked = QuestionText(yesNo);
+            var ours = asked.StartsWith(_abandonQuestion, StringComparison.Ordinal);
+            AbandonDetail = $"a question is up: \"{asked.Replace("\n", " / ").Replace("\r", string.Empty)}\"" + (ours ? " — the abandon question" : " — NOT the abandon question");
+            return ours;
+        }
+        catch (Exception ex)
+        {
+            AbandonDetail = $"could not be read — {ex.Message}";
+            return false;
+        }
+    }
+
+    /// <summary>Yes to "Abandon mission?" - checked again here: that question and no other.</summary>
+    public void ConfirmAbandon()
+    {
+        try
+        {
+            if (!AbandonAsked())
+            {
+                Status = "Confirm abandon: the game is not asking to abandon — NOT answered.";
+                return;
+            }
+
+            Window(YesNo)->FireCallbackInt(0);
+            Status = "Confirm abandon: answered Yes to abandoning the mission.";
+        }
+        catch (Exception ex)
+        {
+            Status = $"Confirm abandon: failed — {ex.Message}";
+        }
+    }
+
+    /// <summary>A yes/no window's question: its text node, else the value it was opened with (as Odysseus reads it).</summary>
+    internal static string QuestionText(AtkUnitBase* yesNo)
+    {
+        var typed = (FFXIVClientStructs.FFXIV.Client.UI.AddonSelectYesno*)yesNo;
+        var shown = typed->PromptText == null ? string.Empty : typed->PromptText->NodeText.ToString();
+        if (shown.Length > 0)
+            return shown.Trim();
+
+        if (yesNo->AtkValuesCount > 0 && yesNo->AtkValues[0].String.Value != null)
+            return Dalamud.Memory.MemoryHelper.ReadSeStringNullTerminated((nint)yesNo->AtkValues[0].String.Value).TextValue.Trim();
+        return string.Empty;
+    }
+
     private void BoardCallback(int callback, uint missionId, string what, bool mustBeSelected)
     {
         try
@@ -302,7 +399,8 @@ public sealed unsafe class MissionWindows
     /// (ECommons' ClickButtonIfEnabled).
     /// </summary>
     /// <param name="never">A word the button's label must not carry.</param>
-    private void Press(string window, uint buttonId, string what, string? never = null)
+    /// <param name="must">What the button's label has to BE; anything else is not pressed.</param>
+    private void Press(string window, uint buttonId, string what, string? never = null, string? must = null)
     {
         try
         {
@@ -324,6 +422,12 @@ public sealed unsafe class MissionWindows
             if (never != null && label.Contains(never, StringComparison.OrdinalIgnoreCase))
             {
                 Status = $"{what}: button {buttonId} reads \"{label}\" — NOT pressed. The window's layout has changed.";
+                return;
+            }
+
+            if (must != null && !string.Equals(label.Trim(), must, StringComparison.OrdinalIgnoreCase))
+            {
+                Status = $"{what}: button {buttonId} reads \"{label}\", not \"{must}\" — NOT pressed.";
                 return;
             }
 

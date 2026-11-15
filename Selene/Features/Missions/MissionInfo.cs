@@ -40,7 +40,7 @@ namespace Selene.Features.Missions;
 public sealed record MissionInfo(
     uint Id, string Name, uint ClassJobId, int LevelGroup, bool IsMaster, int TimeLimitSeconds, uint SilverScore, uint GoldScore,
     IReadOnlyList<uint> RecipeIds, MissionCategory? Special = null, IReadOnlyList<CraftStep>? Crafts = null,
-    MissionReward? Reward = null, IReadOnlyList<QuestNeed>? Needs = null, uint UnlockFunction = 0)
+    MissionReward? Reward = null, IReadOnlyList<QuestNeed>? Needs = null, uint UnlockFunction = 0, MissionWindow? Window = null)
 {
     /// <summary>
     /// The tab the mission is listed under (the user, 2026-11-14: "wire in the other missions, like ice does
@@ -100,6 +100,59 @@ public sealed record MissionReward(
                 parts.Add($"{KindName(kind)} {amount}");
             return string.Join(" · ", parts);
         }
+    }
+}
+
+/// <summary>
+/// When the game offers a weather or timed mission (<c>WKSMissionLotterySpecialCond</c>): hours of the
+/// Eorzean day, or a weather. One or the other - a row holds a weather OR hours.
+/// </summary>
+/// <param name="StartHour">The Eorzean hour it opens at (0-23); meaningful when <paramref name="Weather"/> is empty.</param>
+/// <param name="EndHour">The Eorzean hour it closes at (1-24).</param>
+/// <param name="Weather">The weather's name; empty for a timed mission.</param>
+public sealed record MissionWindow(int StartHour, int EndHour, string Weather)
+{
+    public bool ByWeather => Weather.Length > 0;
+
+    /// <summary>What it waits on, for a status line; with the clock, how long until its hours come.</summary>
+    public string Text(DateTime? utcNow = null)
+    {
+        if (ByWeather)
+            return $"in {Weather}";
+
+        var hours = $"hours {StartHour}-{EndHour}";
+        if (utcNow is not { } now)
+            return hours;
+
+        var wait = EorzeaClock.MinutesUntil(now, StartHour, EndHour);
+        return wait == 0 ? $"{hours}, open now" : $"{hours}, in {wait} min";
+    }
+}
+
+/// <summary>
+/// The Eorzean clock, from the real one: an Eorzean day is 70 real minutes (3600 Eorzean seconds to 175
+/// real ones), counted from the Unix epoch. Pure.
+/// </summary>
+public static class EorzeaClock
+{
+    private const double RealSecondsAnHour = 175.0;
+
+    /// <summary>The Eorzean hour of the day, with its fraction (0 up to 24).</summary>
+    public static double Hour(DateTime utc)
+    {
+        var real = (utc.ToUniversalTime() - DateTime.UnixEpoch).TotalSeconds;
+        return real / RealSecondsAnHour % 24.0;
+    }
+
+    /// <summary>Real minutes until the hours [start, end) are next open, rounded up; 0 = open now.</summary>
+    public static int MinutesUntil(DateTime utc, int startHour, int endHour)
+    {
+        var hour = Hour(utc);
+        if (hour >= startHour && hour < endHour)
+            return 0;
+
+        var ahead = (startHour - hour + 24.0) % 24.0;
+        return (int)Math.Ceiling(ahead * RealSecondsAnHour / 60.0);
     }
 }
 

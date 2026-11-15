@@ -42,7 +42,9 @@ public sealed record MissionView(
     IReadOnlyList<ActionNeed>? JobUnlocks = null, IReadOnlyCollection<uint>? QuestsDone = null,
     uint CurrentJobId = 0, IReadOnlyList<(uint JobId, string Name)>? Classes = null, string? ClassNote = null,
     ToolState? Tool = null, ChainMode ChainMode = ChainMode.Ticked, int ChainLimit = 0, bool ChainActive = false,
-    string ChainStatus = "")
+    string ChainStatus = "",
+    bool Reroll = true, uint StarTerritory = 0, uint HereTerritory = 0, bool TripActive = false, string TripStatus = "",
+    int GearPercent = 100, int RepairAt = 50, bool RepairActive = false, string RepairStatus = "", bool WaitForSpecial = true)
 {
     /// <summary>
     /// The page shows the class the character is ON. False = another class was picked in the sidebar: its
@@ -144,6 +146,30 @@ public sealed class MainWindow : Window
 
     /// <summary>The rank at which ranked missions are reported was chosen.</summary>
     public Action<MissionRank>? SetReportGoal { get; set; }
+
+    /// <summary>"Gold all" may (true) or may not turn the board over when nothing it wants is offered.</summary>
+    public Action<bool>? SetReroll { get; set; }
+
+    /// <summary>"Gold all" may (true) or may not stay on for the missions that come with the hours or the weather.</summary>
+    public Action<bool>? SetWait { get; set; }
+
+    /// <summary>The gear condition under which a chain goes to the mender before its next mission (0 = never).</summary>
+    public Action<int>? SetRepairAt { get; set; }
+
+    /// <summary>"Repair now" on the Missions page: go to the star's mender and repair.</summary>
+    public Action? RepairNow { get; set; }
+
+    /// <summary>"Stop repair" on the Missions page.</summary>
+    public Action? StopRepair { get; set; }
+
+    /// <summary>The star the character works on was picked in the sidebar (its zone id; 0 = none).</summary>
+    public Action<uint>? SetStar { get; set; }
+
+    /// <summary>"Go there" in the sidebar: travel to the picked star (Lifestream does it).</summary>
+    public Action? GoToStar { get; set; }
+
+    /// <summary>"Stop trip" in the sidebar.</summary>
+    public Action? StopTrip { get; set; }
 
     // [SUPERSEDED 2026-11-12 by the sidebar layout below — the first window's two tabs]
     // public override void Draw()
@@ -271,6 +297,56 @@ public sealed class MainWindow : Window
         Tab("Settings", FontAwesomeIcon.Cog, MainPage.Settings);
         Tab("Debug", FontAwesomeIcon.Bug, MainPage.Debug);
         DrawClassPicker();
+        DrawStarPicker();
+    }
+
+    /// <summary>
+    /// The star the character works on (the user, 2026-11-14: "a pick but make it a setting, like a drop
+    /// down"): kept a character. "Go there" travels to it - Lifestream teleports to Bestways Burrow and takes
+    /// the aetheryte's entry for the star. Selene never travels by itself.
+    /// </summary>
+    private void DrawStarPicker()
+    {
+        if (Missions is not { StarName: { } starName } view || view.CurrentJobId == 0)
+            return;
+
+        SeleneTheme.SectionLabel("Star");
+        ImGui.BeginDisabled(view.TripActive);
+        ImGui.SetNextItemWidth(-1f);
+        using (var stars = ImRaii.Combo("##SeleneStar", view.StarTerritory == 0 ? "None picked" : starName(view.StarTerritory)))
+        {
+            if (stars)
+            {
+                if (ImGui.Selectable("None picked", view.StarTerritory == 0))
+                    SetStar?.Invoke(0);
+                foreach (var (territoryId, _) in MissionStars.Stars)
+                {
+                    var here = territoryId == view.HereTerritory;
+                    if (ImGui.Selectable(starName(territoryId) + (here ? " (here)" : string.Empty), territoryId == view.StarTerritory))
+                        SetStar?.Invoke(territoryId);
+                }
+            }
+        }
+
+        ImGui.EndDisabled();
+        SeleneTheme.Tooltip("The star this character works on. Kept for the character; nothing travels until \"Go there\" is pressed.");
+
+        if (view.TripActive)
+        {
+            if (ImGui.Button("Stop trip", new Vector2(-1f, 0f)))
+                StopTrip?.Invoke();
+        }
+        else
+        {
+            ImGui.BeginDisabled(view.StarTerritory == 0 || view.StarTerritory == view.HereTerritory || view.RunActive || view.ChainActive);
+            if (ImGui.Button("Go there", new Vector2(-1f, 0f)))
+                GoToStar?.Invoke();
+            ImGui.EndDisabled();
+            SeleneTheme.Tooltip("Lifestream teleports to Bestways Burrow and takes the aetheryte's \"Travel to ...\" for this star. Home World only; not with a mission in progress. BUILT, NEVER RUN: watch the first trip.");
+        }
+
+        if (view.TripStatus.Length > 0)
+            SeleneTheme.TextWrapped(view.TripStatus, view.TripActive ? SeleneTheme.StatusGreen : SeleneTheme.TextMuted);
     }
 
     /// <summary>
@@ -887,7 +963,9 @@ public sealed class MainWindow : Window
 
     private static string ChainHelp(ChainMode mode) => mode switch
     {
-        ChainMode.GoldAll => "Runs whatever on offer is not gold yet, lowest rank first, each reported at gold. Ends when every mission Selene can run on this star is gold. Master missions have no star and are left out.",
+        // [SUPERSEDED 2026-11-14 — re-rolling was added for this mode]
+        // ChainMode.GoldAll => "Runs whatever on offer is not gold yet, lowest rank first, each reported at gold. Ends when every mission Selene can run on this star is gold. Master missions have no star and are left out.",
+        ChainMode.GoldAll => "Runs whatever on offer is not gold yet, lowest rank first, each reported at gold. Ends when every mission Selene can run on this star is gold. Master missions have no star and are left out. With \"Re-roll\" ticked it turns the board over when none of them is offered.",
         ChainMode.LevelTool => "Runs whatever on offer pays most of the data the cosmic tool still lacks. Ends when the tool has all its stage asks for: handing it in at Researchingway is still yours to do.",
         ChainMode.ClassPoints => "Runs Master missions (the ticked ones, else any) and reports each as soon as the game ranks it. One not measured yet goes first; after that the one that pays the most class points a minute.",
         _ => "Runs the missions ticked one by one and whatever the game offers on a tab ticked as a whole, each reported at the rank beside Run.",
@@ -895,8 +973,9 @@ public sealed class MainWindow : Window
 
     /// <summary>
     /// Missions one after another (the user, 2026-11-14: "quest chaining for different types"): how the next
-    /// one is chosen, an optional number to stop at, and the two ways to end it. Nothing is re-rolled: when
-    /// nothing wanted is on offer the chain stops and says so.
+    /// one is chosen, an optional number to stop at, and the two ways to end it. When nothing wanted is on
+    /// offer the chain stops and says so - except "Gold all" with its "Re-roll" tick (2026-11-14), which then
+    /// turns the board over: a mission accepted and abandoned, or now and then run in an abandon's place.
     /// </summary>
     private void DrawChainControls(MissionView view)
     {
@@ -927,6 +1006,28 @@ public sealed class MainWindow : Window
         if (ImGui.InputInt("##SeleneChainLimit", ref limit, 0, 0) && limit != view.ChainLimit)
             SetChain?.Invoke(view.ChainMode, limit);
         SeleneTheme.Tooltip("Stop after this many missions. 0 = no limit: it goes on until the mode's goal is reached, nothing wanted is on offer, or something stops it.");
+
+        if (view.ChainMode == ChainMode.GoldAll)
+        {
+            ImGui.SameLine();
+            var reroll = view.Reroll;
+            if (ImGui.Checkbox("Re-roll##SeleneReroll", ref reroll))
+                SetReroll?.Invoke(reroll);
+            SeleneTheme.Tooltip(
+                "When no mission that still needs gold is offered: accept an already-gold mission of the wanted rank and abandon it, which makes the game draw new ones - "
+                + $"and about one time in four run it instead. At most {MissionChain.MaxRerolls} turns in a row, then the chain stops. "
+                + "THE GAME WARNS that abandoning resets your gold count. Unticked: the chain stops when nothing wanted is offered.");
+
+            ImGui.SameLine();
+            var wait = view.WaitForSpecial;
+            if (ImGui.Checkbox("Wait##SeleneWait", ref wait))
+                SetWait?.Invoke(wait);
+            SeleneTheme.Tooltip(
+                "When what is left is offered only at certain hours or in certain weather: the chain stays on, says what it is waiting for, looks again every "
+                + $"{MissionChain.WaitLook.Min}-{MissionChain.WaitLook.Max} s and takes each when the game offers it. These count for the star's gold achievement. "
+                + "It waits until you stop it. Unticked: the chain stops there. BUILT, NEVER RUN.");
+        }
+
         ImGui.EndDisabled();
 
         ImGui.SameLine();
@@ -955,7 +1056,48 @@ public sealed class MainWindow : Window
             SeleneTheme.Tooltip("Stage, and for each kind of data what the tool has against what the stage asks for. A mission's \"Tool data\" column is what it pays of each kind.");
         }
 
+        DrawRepairControls(view);
         SeleneTheme.VSpace(4f);
+    }
+
+    /// <summary>
+    /// The repair at the star's mender (the user, 2026-11-15: "need to wire in repair like ice does"; "Mender
+    /// at the hub"; "A setting, 50%"): how worn the gear is, the figure under which a chain goes to the mender
+    /// before its next mission, and a button to go now. Never with a mission in progress.
+    /// </summary>
+    private void DrawRepairControls(MissionView view)
+    {
+        var scale = ImGuiHelpers.GlobalScale;
+        var worn = view.RepairAt > 0 && view.GearPercent < view.RepairAt;
+        SeleneTheme.Text($"Gear {view.GearPercent}%", worn ? SeleneTheme.Amber : SeleneTheme.TextDim);
+        ImGui.SameLine();
+        SeleneTheme.Text("· to the mender under", SeleneTheme.TextDim);
+        ImGui.SameLine();
+        ImGui.SetNextItemWidth(50f * scale);
+        var repairAt = view.RepairAt;
+        if (ImGui.InputInt("##SeleneRepairAt", ref repairAt, 0, 0) && repairAt != view.RepairAt)
+            SetRepairAt?.Invoke(repairAt);
+        SeleneTheme.Tooltip("Before a chain's next mission: when the most worn piece is under this, Selene walks to the star's mender and repairs for gil, then carries on. 0 = never (the chain then stops at Hephaestus's own gate). A mission in progress is always finished and reported first.");
+        ImGui.SameLine();
+        SeleneTheme.Text("%", SeleneTheme.TextDim);
+
+        ImGui.SameLine();
+        if (view.RepairActive)
+        {
+            if (ImGui.Button("Stop repair", new Vector2(100f * scale, 0f)))
+                StopRepair?.Invoke();
+        }
+        else
+        {
+            ImGui.BeginDisabled(!view.State.InZone || view.RunActive || view.GearPercent >= 99);
+            if (ImGui.Button("Repair now", new Vector2(100f * scale, 0f)))
+                RepairNow?.Invoke();
+            ImGui.EndDisabled();
+            SeleneTheme.Tooltip("Walks to the star's mender (Godgyth, at the hub), repairs everything worn for gil, and stops there. BUILT, NEVER RUN: watch the first one - the walk is Ariadne's and has not been seen working from Selene.");
+        }
+
+        if (view.RepairStatus.Length > 0)
+            SeleneTheme.TextWrapped(view.RepairStatus, view.RepairActive ? SeleneTheme.StatusGreen : SeleneTheme.TextSecondary);
     }
 
     private static void DrawMissionTiles(MissionView view)

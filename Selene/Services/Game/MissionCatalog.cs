@@ -60,6 +60,15 @@ public sealed class MissionCatalog
                         ? MissionCategory.Weather
                         : MissionCategory.Timed;
 
+                // When a weather or timed mission is offered: the weather's name, or the Eorzean hours.
+                MissionWindow? window = null;
+                if (special is MissionCategory.Weather or MissionCategory.Timed && row.WKSMissionLotterySpecialCond.ValueNullable is { } offeredWhen)
+                {
+                    window = new MissionWindow(
+                        offeredWhen.StartTimeHour, offeredWhen.EndTimeHour,
+                        offeredWhen.WeatherRequired.RowId != 0 ? offeredWhen.WeatherRequired.ValueNullable?.Name.ExtractText() ?? "a weather" : string.Empty);
+                }
+
                 // More than one recipe: what to make, how many and in which order (CraftStep.Plan has the rule).
                 IReadOnlyList<CraftStep>? crafts = null;
                 if (recipes.Count > 1)
@@ -133,7 +142,7 @@ public sealed class MissionCatalog
 
                 _missions[row.RowId] = new MissionInfo(
                     row.RowId, name, category == 0 ? 0 : category - 1, row.LevelGroup, row.Unknown2, row.MissionTime,
-                    row.SilverStarRequirement, row.GoldStarRequirement, recipes, special, crafts, reward, needs, row.WKSFunction.RowId);
+                    row.SilverStarRequirement, row.GoldStarRequirement, recipes, special, crafts, reward, needs, row.WKSFunction.RowId, window);
             }
 
             foreach (var job in data.GetExcelSheet<ClassJob>())

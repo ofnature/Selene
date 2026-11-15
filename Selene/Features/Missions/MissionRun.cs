@@ -39,6 +39,12 @@ public enum RunPhase
     /// <summary>Pressing Report until the game shows the mission gone.</summary>
     Reporting,
 
+    /// <summary>
+    /// A re-roll: the mission was accepted only to be thrown away. Pressing Abandon and answering the game's
+    /// "Abandon mission?" until the game shows the mission gone.
+    /// </summary>
+    Abandoning,
+
     Done,
 
     /// <summary>Stopped with the reason in <see cref="MissionRun.Status"/>; a person takes it from here.</summary>
@@ -81,6 +87,12 @@ public enum RunCommand
 
     /// <summary>The Report button of the game's Mission in Progress window.</summary>
     Report,
+
+    /// <summary>The Abandon button of the game's Mission in Progress window - a re-roll's, and no other's.</summary>
+    Abandon,
+
+    /// <summary>Yes to the game's "Abandon mission?" - that question and no other.</summary>
+    ConfirmAbandon,
 }
 
 /// <param name="LogOpen">The Cosmic Crafting Log is on screen.</param>
@@ -88,9 +100,11 @@ public enum RunCommand
 /// <param name="BoardMissions">The missions in the rows the board shows right now.</param>
 /// <param name="BoardSelected">The mission selected on the board; 0 = none.</param>
 /// <param name="ConfirmMission">The mission the game is asking to commence right now ("Commence selected mission?"); 0 = it is not asking.</param>
+/// <param name="AbandonAsked">The game is asking "Abandon mission?" right now.</param>
 public readonly record struct RunObservation(
     MissionState Mission, HephaestusStatus Hephaestus, bool LogOpen,
-    bool BoardOpen = false, IReadOnlyList<uint>? BoardMissions = null, uint BoardSelected = 0, uint ConfirmMission = 0)
+    bool BoardOpen = false, IReadOnlyList<uint>? BoardMissions = null, uint BoardSelected = 0, uint ConfirmMission = 0,
+    bool AbandonAsked = false)
 {
     public bool Lists(uint missionId) => BoardMissions != null && BoardMissions.Contains(missionId);
 }
@@ -98,15 +112,20 @@ public readonly record struct RunObservation(
 /// <summary>
 /// ONE mission, ATTENDED: accept it on the game's board, open the Cosmic Crafting Log, start Hephaestus,
 /// watch the clock, have the item in hand finished before the time is out, press Report. It runs a mission
-/// the user TICKED and no other, and it never abandons one. (First built from the craft onward - the user,
-/// 2026-11-12: "Yes, I accept first" - and run once that way; then: "have selene accept the mission and
-/// open the log itself".)
+/// the user TICKED and no other. (First built from the craft onward - the user, 2026-11-12: "Yes, I accept
+/// first" - and run once that way; then: "have selene accept the mission and open the log itself".)
+/// [SUPERSEDED 2026-11-14 — this read "and it never abandons one"; a re-roll now does, in the one case below]
+///
+/// IT ABANDONS IN ONE CASE ONLY (the user, 2026-11-14: "need to figure out the rerolling missions for
+/// finishing golds" - until then it never did): a run started as a DISCARD accepts the mission and abandons
+/// it straight away, which is how the game's board is turned over. Only a mission this run accepted itself,
+/// only while its score is still 0; a mission that was already in progress is never abandoned.
 ///
 /// Pure: an observation in, at most one command out. Every outcome is judged by reading the game again -
 /// the board open, the mission in progress, Hephaestus busy, the mission gone - never by what a call
 /// returned. Every step has a pace, a deadline and a cap on repeats; when one runs out the run HALTS and
-/// says why, and a person takes over. It answers ONE dialog - the game's own "Commence selected mission?"
-/// for the mission it went for; any other that comes up stops it at that step.
+/// says why, and a person takes over. It answers the game's own "Commence selected mission?" for the
+/// mission it went for and, on a discard, "Abandon mission?"; any other dialog stops it at that step.
 /// </summary>
 public sealed class MissionRun
 {
@@ -165,6 +184,9 @@ public sealed class MissionRun
 
     public bool Active => Phase is not (RunPhase.Idle or RunPhase.Done or RunPhase.Halted);
 
+    /// <summary>This run is a re-roll: the mission is accepted to be abandoned, not worked.</summary>
+    public bool Discard { get; private set; }
+
     /// <summary>The run is still getting the mission accepted: it is not in progress yet.</summary>
     private bool Accepting => Phase is RunPhase.OpeningBoard or RunPhase.FindingMission or RunPhase.Selecting or RunPhase.Initiating;
 
@@ -177,13 +199,21 @@ public sealed class MissionRun
     /// The ticked missions Selene can run: it runs no other. The caller leaves out what is ticked but not
     /// runnable yet (since 2026-11-14 every kind of mission can be ticked; only Master crafting ones run).
     /// </param>
-    public bool Start(RunObservation obs, IReadOnlyCollection<uint> picked, DateTime now)
+    /// <param name="discard">
+    /// A re-roll (2026-11-14): accept the first of <paramref name="picked"/> the game offers and abandon it
+    /// at once. Refused with a mission in progress - Selene abandons only what it accepted to abandon.
+    /// </param>
+    public bool Start(RunObservation obs, IReadOnlyCollection<uint> picked, DateTime now, bool discard = false)
     {
         if (Active)
             return false;
 
         var mission = obs.Mission;
         var hephaestus = obs.Hephaestus;
+        if (discard)
+            return StartDiscard(mission, picked, now);
+
+        Discard = false;
         // [SUPERSEDED 2026-11-14 — the other kinds of mission are run too: any list the game holds counts]
         // var offeredAndPicked = mission.OfferedMaster.Where(picked.Contains).ToList();
         var offeredAndPicked = mission.Offered.Where(picked.Contains).Distinct().ToList();
@@ -237,6 +267,32 @@ public sealed class MissionRun
         return true;
     }
 
+    /// <summary>A re-roll's start: nothing is crafted, so neither Hephaestus nor the gear is asked about.</summary>
+    private bool StartDiscard(MissionState mission, IReadOnlyCollection<uint> picked, DateTime now)
+    {
+        var offered = mission.Offered.Where(picked.Contains).Distinct().ToList();
+        var refusal =
+            !mission.InZone ? "not in a Cosmic Exploration zone"
+            : mission.InMission ? $"mission {mission.CurrentMissionId} is in progress: Selene abandons only a mission it accepted to abandon"
+            : offered.Count == 0 ? "the mission to throw away is not offered any more"
+            : null;
+
+        if (refusal != null)
+        {
+            Phase = RunPhase.Idle;
+            Status = $"Not started — {refusal}.";
+            return false;
+        }
+
+        Discard = true;
+        MissionId = offered[0];
+        _plan = MissionPlan.Master;
+        _step = 0;
+        LastScore = 0;
+        Enter(RunPhase.OpeningBoard, now, StepDeadline, $"Re-roll: opening the mission board for mission {MissionId}, to abandon it");
+        return true;
+    }
+
     /// <summary>
     /// The user's Stop: the run ends here and the mission is left as it is. If Hephaestus is crafting it is
     /// told to finish the item in hand and start no other.
@@ -246,9 +302,9 @@ public sealed class MissionRun
         if (!Active)
             return RunCommand.None;
 
-        Halt(obs.Mission.InMission
-            ? "Stopped by you — the mission is still in progress: report it yourself"
-            : "Stopped by you — no mission was accepted");
+        Halt(!obs.Mission.InMission ? "Stopped by you — no mission was accepted"
+            : Discard ? "Stopped by you — the mission accepted for the re-roll is still in progress: abandon it yourself"
+            : "Stopped by you — the mission is still in progress: report it yourself");
         return obs.Hephaestus.Busy ? RunCommand.StopAfterItem : RunCommand.None;
     }
 
@@ -269,6 +325,15 @@ public sealed class MissionRun
             if (mission.CurrentMissionId != MissionId)
             {
                 Halt($"Another mission ({mission.CurrentMissionId}) is in progress, not the one Selene went for");
+                return RunCommand.None;
+            }
+
+            // A re-roll: the mission was only ever accepted to be thrown away. A moment first, as a person
+            // looks at what came up before abandoning it.
+            if (Discard)
+            {
+                Enter(RunPhase.Abandoning, now, ReportDeadline, "Re-roll: accepted — abandoning it");
+                _nextCommandAt = now + Pace + Pace;
                 return RunCommand.None;
             }
 
@@ -350,6 +415,13 @@ public sealed class MissionRun
             {
                 Phase = RunPhase.Done;
                 Status = $"Done — reported with a score of {Number(LastScore)}.";
+                return RunCommand.None;
+            }
+
+            if (Phase == RunPhase.Abandoning)
+            {
+                Phase = RunPhase.Done;
+                Status = $"Done — mission {MissionId} abandoned, to turn the board over.";
                 return RunCommand.None;
             }
 
@@ -447,6 +519,16 @@ public sealed class MissionRun
                 }
 
                 return Try(RunCommand.Report, now, "The report did not go through", ReportAttempts);
+
+            case RunPhase.Abandoning:
+                // Only ever a mission with nothing done on it: work is reported, never thrown away.
+                if (mission.Score != 0)
+                    return HaltNone("The mission to abandon has a score — it is not abandoned");
+
+                // "Abandon mission?" - the game's own question, told by its text; any other is left for a person.
+                return obs.AbandonAsked
+                    ? Try(RunCommand.ConfirmAbandon, now, "The abandon question would not take", ReportAttempts)
+                    : Try(RunCommand.Abandon, now, "The mission could not be abandoned", ReportAttempts);
 
             default:
                 return RunCommand.None;

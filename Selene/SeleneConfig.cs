@@ -32,6 +32,34 @@ public sealed class CharacterSettings
 
     /// <summary>A chain stops after this many missions; 0 = no limit.</summary>
     public int ChainLimit { get; set; }
+
+    /// <summary>
+    /// "Gold all" may turn the board over when nothing it wants is offered (the user, 2026-11-14: "need to
+    /// figure out the rerolling missions for finishing golds"; before that day the rule was no re-rolling):
+    /// an already-gold mission of the wanted rank is accepted and abandoned, or now and then run instead.
+    /// A tick, because the game's own abandon question warns that abandoning resets the gold count.
+    /// </summary>
+    public bool Reroll { get; set; } = true;
+
+    /// <summary>
+    /// "Gold all" stays on when what is left comes only at certain hours or in certain weather, and takes
+    /// each when the game offers it (the user, 2026-11-15: "yes but only is those missions are part of the
+    /// acheviement" - they are). Off: the chain stops there, as it did before.
+    /// </summary>
+    public bool WaitForSpecial { get; set; } = true;
+
+    /// <summary>
+    /// Under this gear condition (the lowest piece worn, in percent) a chain goes to the star's mender before
+    /// its next mission (the user, 2026-11-15: "need to wire in repair like ice does"; the figure: "A setting,
+    /// 50%" - ICE's default). 0 = never: the chain then stops at Hephaestus's own gate, as it did before.
+    /// </summary>
+    public int RepairAtPercent { get; set; } = 50;
+
+    /// <summary>
+    /// The star this character works on, as its zone id (the user, 2026-11-14: "a pick but make it a setting,
+    /// like a drop down"); 0 = none picked. Selene travels there when asked to, never by itself.
+    /// </summary>
+    public uint StarTerritory { get; set; }
 }
 
 /// <summary>

@@ -9,7 +9,9 @@ using Dalamud.Plugin.Services;
 using Selene.Features.Characters;
 using Selene.Features.Fishing;
 using Selene.Features.Missions;
+using Selene.Features.Repair;
 using Selene.Features.Schedule;
+using Selene.Features.Travel;
 using Selene.Services;
 using Selene.Services.Game;
 using Selene.Windows;
@@ -57,6 +59,29 @@ public sealed class SelenePlugin : IDalamudPlugin
     private readonly PayoutWatch _payoutWatch = new();
     private readonly PayoutLog _payouts;
     private readonly MissionChain _chain = new();
+    private readonly LifestreamClient _lifestream;
+    private readonly StarTrip _trip = new();
+    private readonly MenderGame _menderGame;
+    private readonly MenderTrip _repair = new();
+
+    /// <summary>The walk to the mender: its own walk, so the Debug page's walk test keeps its verdict.</summary>
+    private readonly StandWalk _menderWalk = new();
+
+    /// <summary>"Repair now" / "Stop repair" were pressed on the Missions page; the tick acts on them.</summary>
+    private bool _repairRequested;
+    private bool _repairStopRequested;
+
+    /// <summary>The chain went to the mender for the mission now due: a second trip for the same mission is not made.</summary>
+    private bool _chainRepairTried;
+
+    /// <summary>"Go there" / "Stop trip" were pressed in the sidebar; the tick acts on them.</summary>
+    private bool _tripRequested;
+    private bool _tripStopRequested;
+
+    /// <summary>What the game held before the last re-roll's abandon, the mission thrown away, and what changed (the Debug page's Re-roll line).</summary>
+    private IReadOnlyList<uint>? _rerollBefore;
+    private uint _rerollMission;
+    private string _rerollNote = "Idle — nothing abandoned yet.";
 
     /// <summary>"Start chain" / "Stop after this mission" were pressed on the Missions page; the tick acts on them.</summary>
     private bool _chainStartRequested;
@@ -138,7 +163,38 @@ public sealed class SelenePlugin : IDalamudPlugin
 
         _catalog = new MissionCatalog(data);
         _hephaestus = new HephaestusClient(pluginInterface);
-        _missionWindows = new MissionWindows(gameGui);
+        // [SUPERSEDED 2026-11-14 — the abandon button's word and the abandon question are handed over, from the game's text]
+        // _missionWindows = new MissionWindows(gameGui);
+        string AddonText(uint row)
+        {
+            try
+            {
+                return data.GetExcelSheet<Lumina.Excel.Sheets.Addon>().TryGetRow(row, out var text) ? text.Text.ExtractText() : string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        _missionWindows = new MissionWindows(gameGui, AddonText(16798), AddonText(16965));
+        _lifestream = new LifestreamClient(pluginInterface);
+        // [SUPERSEDED 2026-11-15 — the mender's menu entry is found by its own text, from the game's data]
+        // _menderGame = new MenderGame(gameGui, objectTable, AddonText(861));
+        string MenderOption()
+        {
+            try
+            {
+                // The mender's handler on Godgyth (CustomTalk 720915): its MainOption is the menu's entry, "Repair Gear".
+                return data.GetExcelSheet<Lumina.Excel.Sheets.CustomTalk>().TryGetRow(720915, out var talk) ? talk.MainOption.ExtractText() : string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        _menderGame = new MenderGame(gameGui, objectTable, AddonText(861), MenderOption());
         _players = new NearbyPlayers(objectTable);
         _shards = new AethernetShards(data);
 
@@ -164,6 +220,14 @@ public sealed class SelenePlugin : IDalamudPlugin
         };
         _mainWindow.SetWholeTab = SetWholeTab;
         _mainWindow.SetReportGoal = SetReportGoal;
+        _mainWindow.SetReroll = SetReroll;
+        _mainWindow.SetWait = SetWait;
+        _mainWindow.SetRepairAt = SetRepairAt;
+        _mainWindow.RepairNow = () => { _repairRequested = true; _nextTick = default; };
+        _mainWindow.StopRepair = () => { _repairStopRequested = true; _nextTick = default; };
+        _mainWindow.SetStar = SetStar;
+        _mainWindow.GoToStar = () => { _tripRequested = true; _nextTick = default; };
+        _mainWindow.StopTrip = () => { _tripStopRequested = true; _nextTick = default; };
         _run = new MissionRun(PlanFor);
 
         // The edge dock, as in Daedalus: one "Selene" tab, shown while a character is logged in, popping the
@@ -207,6 +271,14 @@ public sealed class SelenePlugin : IDalamudPlugin
         // The walk test: a character is not left walking with nobody watching where it stops.
         if (_walk.Active)
             _ariadne.Stop();
+
+        // The walk to the mender: the same.
+        if (_menderWalk.Active)
+            _ariadne.Stop();
+
+        // The trip to a star: Lifestream is not left travelling with nobody judging where it ends.
+        if (_trip.Active)
+            _lifestream.Abort();
 
         _framework.Update -= OnFrameworkUpdate;
         _pluginInterface.UiBuilder.Draw -= Draw;
@@ -315,30 +387,107 @@ public sealed class SelenePlugin : IDalamudPlugin
             _character.Position, _character.Rotation, _ariadne.Ready, _ariadne.Busy, _ariadne.LastResult, _ariadne.Reach, _ariadne.ReachPoint);
         if (_walkStopRequested)
         {
-            ExecuteWalk(_walk.Stop(WalkSees()));
+            ExecuteWalk(_walk, _walk.Stop(WalkSees()));
         }
-        else if (_walkRequested && _chosen is { } spot && !_walk.Active)
+        else if (_walkRequested && _chosen is { } spot && !_walk.Active && !_menderWalk.Active)
         {
             _ariadne.ForgetReach(); // each walk asks the mesh about its own place
             _walk.Start(WalkSees(), spot.At, spot.Facing, now);
         }
 
         _walkRequested = _walkStopRequested = false;
-        ExecuteWalk(_walk.Tick(WalkSees(), now));
+        ExecuteWalk(_walk, _walk.Tick(WalkSees(), now));
 
         // The attended run: Selene accepts a ticked mission (or takes over one accepted by hand), opens the
         // log, crafts, watches the clock and reports.
         var board = _missionWindows.ReadBoard();
         var observation = new RunObservation(
             missionState, hephaestus, _missionWindows.LogOpen, board.Open, board.Missions, board.Selected,
-            _missionWindows.ConfirmingMission());
+            _missionWindows.ConfirmingMission(), _missionWindows.AbandonAsked());
+
+        // The trip to the picked star (the sidebar's "Go there"): Lifestream travels, the zone is the verdict.
+        _lifestream.Read();
+        TripObservation TripSees() => new(
+            _character.TerritoryId, _character.Position != null, _character.OnHomeWorld, _lifestream.Available, _lifestream.Busy,
+            missionState.InMission, _run.Active || _chain.Active);
+        if (_tripStopRequested)
+        {
+            ExecuteTrip(_trip.Stop(TripSees()));
+        }
+        else if (_tripRequested && !_trip.Active)
+        {
+            var star = character?.StarTerritory ?? 0;
+            _trip.Start(TripSees(), star, MissionStars.Stars.ToList().FindIndex(entry => entry.TerritoryId == star), _catalog.StarName(star), now);
+        }
+
+        _tripRequested = _tripStopRequested = false;
+        ExecuteTrip(_trip.Tick(TripSees(), now));
         // The cosmic tool of the character's job (for the "level the tool" chain) and of the class shown.
         var tool = missionState.InZone ? _missionReader.ReadTool(job, missionState.TerritoryId) : null;
         var viewTool = viewJob == job ? tool : viewState.InZone ? _missionReader.ReadTool(viewJob, viewState.TerritoryId) : null;
 
+        // The repair at the star's mender: on "Repair now", and before a chain's next mission when the gear is
+        // under the character's figure. Never with a mission in progress (the user, 2026-11-15: "just have it
+        // finish and then turn in then selene goes and repairs prior to starting another missin").
+        var mender = Menders.For(_character.TerritoryId);
+        MenderObservation MenderSees() => new(
+            _character.Position != null, _menderGame.GearPercent, mender == null ? null : _menderGame.Distance(mender.NpcId),
+            _menderGame.MenuOpen, _menderGame.RepairOpen, _repair.Active && _menderGame.RepairAsked(),
+            _menderWalk.Phase, _menderWalk.Status);
+        string? RepairBlocked()
+            => missionState.InMission ? "a mission is in progress: it is finished and reported first"
+                : _run.Active ? "a mission run is going"
+                : hephaestus.Busy ? "Hephaestus is busy"
+                : _trip.Active ? "a trip to a star is going"
+                : _walk.Active ? "the walk test is going"
+                : null;
+        bool StartRepair()
+            => _repair.Start(MenderSees(), mender, mender == null ? default : StandBeside(mender, contentId, now), RepairBlocked(), now);
+
+        if (_repairStopRequested || _stopRequested)
+            ExecuteMender(_repair.Stop(MenderSees()), mender, WalkSees(), now);
+        else if (_repairRequested && !_repair.Active)
+            StartRepair();
+        _repairRequested = _repairStopRequested = false;
+        ExecuteMender(_repair.Tick(MenderSees(), now), mender, WalkSees(), now);
+        ExecuteWalk(_menderWalk, _menderWalk.Tick(WalkSees(), now));
+
+        // What the chain is told when a mission is due: wait for the mender, or go on.
+        string? HoldForRepair()
+        {
+            if (_repair.Active)
+                return $"at the mender: {_repair.Status}";
+
+            var repairAt = character?.RepairAtPercent ?? 50;
+            if (repairAt <= 0 || mender == null || missionState.InMission)
+                return null;
+
+            var gearNow = _menderGame.GearPercent;
+            if (gearNow >= repairAt)
+            {
+                _chainRepairTried = false;
+                return null;
+            }
+
+            if (_chainRepairTried)
+            {
+                _chain.Stop($"Stopped — gear is at {gearNow}% and the repair did not mend it: {_repair.Status}");
+                return null;
+            }
+
+            _chainRepairTried = true;
+            if (!StartRepair())
+            {
+                _chain.Stop($"Stopped — gear is at {gearNow}% and the repair could not start: {_repair.Status}");
+                return null;
+            }
+
+            return $"gear at {gearNow}% (mended under {repairAt}%): going to the mender";
+        }
+
         if (_chainStopAfterRequested)
             _chain.StopAfterThis();
-        if (_chainStartRequested && !_chain.Active && !_stopRequested)
+        if (_chainStartRequested && !_chain.Active && !_stopRequested && !_trip.Active)
             _chain.Start(character?.ChainMode ?? ChainMode.Ticked, character?.ChainLimit ?? 0, now);
         _chainStartRequested = _chainStopAfterRequested = false;
 
@@ -349,15 +498,43 @@ public sealed class SelenePlugin : IDalamudPlugin
         // [SUPERSEDED 2026-11-14 — every kind of mission can be ticked now; only Master crafting ones are run]
         // else if (_runRequested)
         //     _run.Start(observation, picks, now);
-        else if (_runRequested)
+        else if (_runRequested && !_trip.Active)
             _run.Start(observation, runnable, now);
         _runRequested = _stopRequested = false;
         Execute(_run.Tick(observation, now));
 
         // The chain: when a mission is due, which one - and the run is asked to take exactly that one.
-        var next = _chain.Tick(_run.Phase, _run.Status, () => ChooseNext(missionState, picks, wholeTabs, tool, contentId, now), now, contentId);
-        if (next != 0 && !_run.Start(observation, new[] { next }, now))
-            _chain.Stop($"Stopped — the mission was not started: {_run.Status}");
+        // [SUPERSEDED 2026-11-15 — the chain is told to wait for the mender when the gear is worn]
+        // var next = _chain.Tick(_run.Phase, _run.Status, () => ChooseNext(missionState, picks, wholeTabs, tool, contentId, now), now, contentId);
+        var next = _chain.Tick(
+            _run.Phase, _run.Status, () => ChooseNext(missionState, picks, wholeTabs, tool, contentId, now), now, contentId, HoldForRepair);
+        if (next != 0)
+            _chainRepairTried = false;
+        // [SUPERSEDED 2026-11-14 — a re-roll's mission is started as a discard: accepted to be abandoned]
+        // if (next != 0 && !_run.Start(observation, new[] { next }, now))
+        //     _chain.Stop($"Stopped — the mission was not started: {_run.Status}");
+        if (next != 0)
+        {
+            if (!_run.Start(observation, new[] { next }, now, _chain.Discard))
+            {
+                _chain.Stop($"Stopped — the mission was not started: {_run.Status}");
+            }
+            else if (_chain.Discard)
+            {
+                // What the game holds now, to set beside what it holds once the mission is abandoned.
+                _rerollBefore = missionState.Offered.ToList();
+                _rerollMission = next;
+            }
+            else
+            {
+                _rerollBefore = null;
+            }
+        }
+
+        // What an abandon re-draws (the user did not know; ICE's code suggests the abandoned mission's rank only):
+        // the held missions before and after, for the Debug page.
+        if (_rerollBefore != null && _run is { Discard: true, Phase: RunPhase.Done } && !missionState.InMission)
+            _rerollNote = RerollNote(_rerollBefore, missionState.Offered.ToList(), _rerollMission);
 
         // The sidebar's "Change to ..." was pressed: Hephaestus changes the job (the careful change its own queue
         // makes). Never under a run or with a mission in progress; what came of it shows as the character's job.
@@ -404,7 +581,17 @@ public sealed class SelenePlugin : IDalamudPlugin
             ChainMode: character?.ChainMode ?? ChainMode.Ticked,
             ChainLimit: character?.ChainLimit ?? 0,
             ChainActive: _chain.Active,
-            ChainStatus: _chain.Status);
+            ChainStatus: _chain.Status,
+            Reroll: character?.Reroll ?? true,
+            WaitForSpecial: character?.WaitForSpecial ?? true,
+            GearPercent: _menderGame.GearPercent,
+            RepairAt: character?.RepairAtPercent ?? 50,
+            RepairActive: _repair.Active,
+            RepairStatus: _repair.Status.StartsWith("Idle", StringComparison.Ordinal) ? string.Empty : _repair.Status,
+            StarTerritory: character?.StarTerritory ?? 0,
+            HereTerritory: _character.TerritoryId,
+            TripActive: _trip.Active,
+            TripStatus: _trip.Status.StartsWith("Idle", StringComparison.Ordinal) ? string.Empty : _trip.Status);
 
         var rows = ScheduleBoard.Build(_roster.Names, contentId, _schedule, now);
         var mine = rows.FirstOrDefault(row => row.IsThisCharacter);
@@ -420,6 +607,8 @@ public sealed class SelenePlugin : IDalamudPlugin
             ("Hephaestus", _hephaestus.Status),
             ("Mission run", _run.Status),
             ("Chain", _chain.Status),
+            ("Re-roll", _rerollNote),
+            ("Abandon q.", _missionWindows.AbandonDetail),
             ("Asked of Heph.", _hephaestus.LastAction),
             ("Windows", _missionWindows.Status),
             ("Confirmation", _missionWindows.ConfirmDetail),
@@ -433,6 +622,13 @@ public sealed class SelenePlugin : IDalamudPlugin
                 : _walk.Status),
             ("Ariadne", _ariadne.Status),
             ("Asked of Ari.", _ariadne.LastAction),
+            ("Repair", _repair.Status),
+            ("Mender", $"gear {_menderGame.GearPercent}% · {_menderGame.Status}"),
+            ("Repair q.", _menderGame.QuestionDetail),
+            ("Mender walk", _menderWalk.Status),
+            ("Star trip", _trip.Status),
+            ("Lifestream", _lifestream.Status),
+            ("Asked of Life.", _lifestream.LastAction),
         });
     }
 
@@ -453,16 +649,103 @@ public sealed class SelenePlugin : IDalamudPlugin
         return _jobData[job] = new JobData(ofJob.Select(mission => mission.Id).ToList(), unlocks, quests, functions);
     }
 
-    /// <summary>The one thing the walk test asked for this tick. What came of it is read off the game next tick.</summary>
-    private void ExecuteWalk(WalkCommand command)
+    /// <summary>The one thing the trip asked for this tick. What came of it is read off the game next tick.</summary>
+    private void ExecuteTrip(TripCommand command)
     {
         switch (command)
         {
-            case WalkCommand.AskReach: _ariadne.AskReach(_walk.Target, StandWalk.MeshWithin); break;
-            case WalkCommand.Move: _ariadne.MoveTo(_walk.Goal); break;
-            case WalkCommand.Stop: _ariadne.Stop(); break;
-            case WalkCommand.Face: _character.Face(_walk.Facing); break;
+            case TripCommand.Go: _lifestream.GoToStar(_trip.StarIndex, _trip.StarName); break;
+            case TripCommand.Abort: _lifestream.Abort(); break;
         }
+    }
+
+    /// <summary>The held missions before and after an abandon: what left the board, what came, what stayed.</summary>
+    private string RerollNote(IReadOnlyList<uint> before, IReadOnlyList<uint> after, uint abandoned)
+    {
+        string Tag(uint id)
+        {
+            var rank = !_catalog.Missions.TryGetValue(id, out var mission) ? "?"
+                : mission.Category switch
+                {
+                    MissionCategory.RankD => "D",
+                    MissionCategory.RankC => "C",
+                    MissionCategory.RankB => "B",
+                    MissionCategory.RankA => "A/EX",
+                    var other => other.ToString(),
+                };
+            return $"{id} ({rank})";
+        }
+
+        string List(IEnumerable<uint> ids)
+        {
+            var tags = ids.Distinct().OrderBy(id => id).Select(Tag).ToList();
+            return tags.Count == 0 ? "none" : string.Join(", ", tags);
+        }
+
+        return $"Abandoned {Tag(abandoned)}. Gone from what the game holds: {List(before.Except(after))}. "
+               + $"New: {List(after.Except(before))}. Unchanged: {List(before.Intersect(after))}.";
+    }
+
+    /// <summary>The one thing the walk test asked for this tick. What came of it is read off the game next tick.</summary>
+    // [SUPERSEDED 2026-11-15 — there are two walks now (the Debug page's test, and the one to the mender)]
+    // private void ExecuteWalk(WalkCommand command)
+    // {
+    //     switch (command)
+    //     {
+    //         case WalkCommand.AskReach: _ariadne.AskReach(_walk.Target, StandWalk.MeshWithin); break;
+    //         case WalkCommand.Move: _ariadne.MoveTo(_walk.Goal); break;
+    //         case WalkCommand.Stop: _ariadne.Stop(); break;
+    //         case WalkCommand.Face: _character.Face(_walk.Facing); break;
+    //     }
+    // }
+    private void ExecuteWalk(StandWalk walk, WalkCommand command)
+    {
+        switch (command)
+        {
+            case WalkCommand.AskReach: _ariadne.AskReach(walk.Target, StandWalk.MeshWithin); break;
+            case WalkCommand.Move: _ariadne.MoveTo(walk.Goal); break;
+            case WalkCommand.Stop: _ariadne.Stop(); break;
+            case WalkCommand.Face: _character.Face(walk.Facing); break;
+        }
+    }
+
+    /// <summary>The one thing the repair asked for this tick. What came of it is read off the game next tick.</summary>
+    private void ExecuteMender(MenderCommand command, Mender? mender, WalkObservation walkSees, DateTime now)
+    {
+        switch (command)
+        {
+            case MenderCommand.StartWalk:
+                if (mender != null)
+                {
+                    // To end facing the mender, as a person talking to it stands.
+                    var stand = _repair.Stand;
+                    _ariadne.ForgetReach(); // each walk asks the mesh about its own place
+                    _menderWalk.Start(walkSees, stand, MathF.Atan2(mender.At.X - stand.X, mender.At.Z - stand.Z), now);
+                }
+
+                break;
+            case MenderCommand.StopWalk: ExecuteWalk(_menderWalk, _menderWalk.Stop(walkSees)); break;
+            case MenderCommand.Interact:
+                if (mender != null)
+                    _menderGame.Interact(mender.NpcId);
+                break;
+            case MenderCommand.ChooseMender: _menderGame.ChooseMender(); break;
+            case MenderCommand.RepairAll: _menderGame.RepairAll(); break;
+            case MenderCommand.ConfirmRepair: _menderGame.ConfirmRepair(); break;
+            case MenderCommand.Close: _menderGame.Close(); break;
+        }
+    }
+
+    /// <summary>
+    /// A spot beside the mender to walk to: within a short step of where players stand to talk to it, and not
+    /// the same spot every time (the dice move with the minute).
+    /// </summary>
+    private static Vector3 StandBeside(Mender mender, ulong contentId, DateTime now)
+    {
+        var dice = new SeededRandom(contentId, unchecked((int)(now.Ticks / TimeSpan.TicksPerMinute)) ^ 0x4D454E44);
+        var angle = (float)(dice.NextDouble() * MathF.Tau);
+        var reach = (float)(dice.NextDouble() * 0.8);
+        return mender.StandNear + new Vector3(MathF.Sin(angle) * reach, 0f, MathF.Cos(angle) * reach);
     }
 
     /// <summary>
@@ -599,8 +882,14 @@ public sealed class SelenePlugin : IDalamudPlugin
         }
 
         var here = MissionBoard.On(MissionBoard.Build(_catalog.Missions, state, picks, _payouts.Summaries), state.TerritoryId);
+        // [SUPERSEDED 2026-11-14 — re-rolling: the character's tick is handed over, and the dice move with each abandon too]
+        // return MissionChooser.Choose(
+        //     _chain.Mode, here, mission => Runnable(mission.Id), wholeTabs, tool, contentId, (now.DayOfYear * 1000) + _chain.Completed);
+        var reroll = !_config.Characters.TryGetValue(contentId, out var kept) || kept.Reroll;
+        var wait = kept == null || kept.WaitForSpecial;
         return MissionChooser.Choose(
-            _chain.Mode, here, mission => Runnable(mission.Id), wholeTabs, tool, contentId, (now.DayOfYear * 1000) + _chain.Completed);
+            _chain.Mode, here, mission => Runnable(mission.Id), wholeTabs, tool, contentId,
+            (now.DayOfYear * 1000) + _chain.Completed + (_chain.Abandoned * 31), reroll, wait, DateTime.UtcNow);
     }
 
     /// <summary>The chain's mode or limit was changed on the Missions page: kept for the logged-in character.</summary>
@@ -628,6 +917,54 @@ public sealed class SelenePlugin : IDalamudPlugin
         tabs.Remove(category);
         if (whole)
             tabs.Add(category);
+        SaveConfig();
+        _nextTick = default;
+    }
+
+    /// <summary>The gear condition under which a chain goes to the mender: kept for the logged-in character.</summary>
+    private void SetRepairAt(int percent)
+    {
+        var contentId = _character.ContentId;
+        if (contentId == 0)
+            return;
+
+        _config.For(contentId).RepairAtPercent = Math.Clamp(percent, 0, 99);
+        SaveConfig();
+        _nextTick = default;
+    }
+
+    /// <summary>The "Wait" tick beside the chain's mode: kept for the logged-in character.</summary>
+    private void SetWait(bool wait)
+    {
+        var contentId = _character.ContentId;
+        if (contentId == 0)
+            return;
+
+        _config.For(contentId).WaitForSpecial = wait;
+        SaveConfig();
+        _nextTick = default;
+    }
+
+    /// <summary>The "Re-roll" tick beside the chain's mode: kept for the logged-in character.</summary>
+    private void SetReroll(bool reroll)
+    {
+        var contentId = _character.ContentId;
+        if (contentId == 0)
+            return;
+
+        _config.For(contentId).Reroll = reroll;
+        SaveConfig();
+        _nextTick = default;
+    }
+
+    /// <summary>The star picked in the sidebar: kept for the logged-in character. Nothing travels on a pick.</summary>
+    private void SetStar(uint territoryId)
+    {
+        var contentId = _character.ContentId;
+        if (contentId == 0)
+            return;
+
+        _config.For(contentId).StarTerritory = territoryId;
         SaveConfig();
         _nextTick = default;
     }
@@ -667,6 +1004,8 @@ public sealed class SelenePlugin : IDalamudPlugin
                 break;
             case RunCommand.StopAfterItem: _hephaestus.RequestStopAfterRun(); break;
             case RunCommand.Report: _missionWindows.Report(); break;
+            case RunCommand.Abandon: _missionWindows.Abandon(); break;
+            case RunCommand.ConfirmAbandon: _missionWindows.ConfirmAbandon(); break;
         }
     }
 

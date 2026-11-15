@@ -72,11 +72,21 @@ public sealed record ToolState(int Stage, int StarCap, IReadOnlyList<ToolKind> K
 /// <summary>The mission to run next, or why there is none.</summary>
 /// <param name="MissionId">0 = none.</param>
 /// <param name="Finished">With no mission: the mode's goal is reached (as opposed to nothing wanted being on offer).</param>
-public sealed record Choice(uint MissionId, string Why, bool Finished = false);
+/// <param name="Reroll">
+/// The mission is NOT wanted: it is one to turn the board over with (2026-11-14) - accepted and abandoned, or
+/// run instead when <paramref name="CanRun"/> says Selene could.
+/// </param>
+/// <param name="Wait">
+/// With no mission: nothing can be done NOW, but what is left comes with the hours or the weather - the chain
+/// stays on and looks again (2026-11-15), instead of stopping.
+/// </param>
+public sealed record Choice(uint MissionId, string Why, bool Finished = false, bool Reroll = false, bool CanRun = false, bool Wait = false);
 
 /// <summary>
-/// Picks the next mission for a mode, among what the game is OFFERING and Selene can run. It never re-rolls
-/// (the user's rule): when nothing wanted is on offer it says so, and the chain stops. Pure.
+/// Picks the next mission for a mode, among what the game is OFFERING and Selene can run. When nothing wanted
+/// is on offer it says so, and the chain stops - but for "Gold all" with re-rolling on (the user, 2026-11-14:
+/// "need to figure out the rerolling missions for finishing golds"; the rule had been no re-rolling), which
+/// then names a mission to turn the board over with. Pure.
 /// </summary>
 public static class MissionChooser
 {
@@ -84,7 +94,8 @@ public static class MissionChooser
     /// <param name="runnable">What Selene can run at all: a crafting mission with a recipe, not a red alert, not locked.</param>
     public static Choice Choose(
         ChainMode mode, IReadOnlyList<MissionRow> rows, Func<MissionInfo, bool> runnable,
-        IReadOnlyCollection<MissionCategory> wholeTabs, ToolState? tool, ulong seed, int salt)
+        IReadOnlyCollection<MissionCategory> wholeTabs, ToolState? tool, ulong seed, int salt, bool reroll = false,
+        bool wait = false, DateTime? utcNow = null)
     {
         var offered = rows.Where(row => row.Offered && runnable(row.Info)).ToList();
         switch (mode)
@@ -100,9 +111,50 @@ public static class MissionChooser
 
                 // The lower ranks first, as ICE walks them: they turn the board over fastest.
                 var next = offered.Where(row => left.Contains(row)).OrderBy(row => TabOrder(row.Info.Category)).ThenBy(row => row.Info.Id).FirstOrDefault();
-                return next == null
-                    ? new Choice(0, $"{left.Count} mission(s) are not gold yet, but the game is offering none of them")
-                    : new Choice(next.Info.Id, $"not gold yet ({left.Count} left)");
+                // [SUPERSEDED 2026-11-14 — with re-rolling on, a mission to turn the board over with is named instead]
+                // return next == null
+                //     ? new Choice(0, $"{left.Count} mission(s) are not gold yet, but the game is offering none of them")
+                //     : new Choice(next.Info.Id, $"not gold yet ({left.Count} left)");
+                if (next != null)
+                    return new Choice(next.Info.Id, $"not gold yet ({left.Count} left)");
+
+                // Nothing to do now. With waiting on (the user, 2026-11-15: "yes but only is those missions are
+                // part of the acheviement" - they are: a star's achievement asks for EVERY mission on it), and a
+                // weather or timed mission among what is left, the answer is "look again later", not "stop".
+                Choice NothingNow(string why)
+                {
+                    var awaited = left.Where(row => row.Info.Category is MissionCategory.Weather or MissionCategory.Timed).ToList();
+                    if (!wait || awaited.Count == 0)
+                        return new Choice(0, why);
+
+                    var names = awaited.OrderBy(row => row.Info.Id)
+                        .Select(row => $"{row.Info.Name.Trim()} ({row.Info.Window?.Text(utcNow) ?? "hours or weather"})");
+                    return new Choice(0, $"waiting for {awaited.Count} of the {left.Count} left, which the game offers only at their hours or in their weather: {string.Join("; ", names)}", Wait: true);
+                }
+
+                if (!reroll)
+                    return NothingNow($"{left.Count} mission(s) are not gold yet, but the game is offering none of them");
+
+                // Only the plain ranked missions can be re-rolled for: a sequence, weather or timed mission
+                // comes by itself (ICE waits for those too).
+                var ranks = left.Where(row => TabOrder(row.Info.Category) < 4).Select(row => row.Info.Category).Distinct().ToList();
+                if (ranks.Count == 0)
+                    return NothingNow($"{left.Count} mission(s) are not gold yet, all of a kind that comes by itself (sequence, weather, timed): nothing to re-roll for");
+
+                // A mission to throw away: one on offer of a rank that is wanted (ICE's reading: abandoning
+                // re-draws that rank), which the character can accept. Which rank and which mission: by the dice.
+                var spares = rows.Where(row => row.Offered && !row.Locked && ranks.Contains(row.Info.Category)).ToList();
+                if (spares.Count == 0)
+                    return NothingNow($"{left.Count} mission(s) are not gold yet, and nothing of their rank is on offer to turn the board over with");
+
+                var rerollDice = new SeededRandom(seed, salt);
+                var spareRanks = spares.Select(row => row.Info.Category).Distinct().OrderBy(TabOrder).ToList();
+                var rank = spareRanks[Math.Min((int)(rerollDice.NextDouble() * spareRanks.Count), spareRanks.Count - 1)];
+                var ofRank = spares.Where(row => row.Info.Category == rank).OrderBy(row => row.Info.Id).ToList();
+                var spare = ofRank[Math.Min((int)(rerollDice.NextDouble() * ofRank.Count), ofRank.Count - 1)];
+                return new Choice(
+                    spare.Info.Id, $"{left.Count} not gold yet and none on offer: turning the board over",
+                    Reroll: true, CanRun: runnable(spare.Info));
             }
 
             case ChainMode.LevelTool:
@@ -176,8 +228,11 @@ public static class MissionChooser
 /// It only decides WHEN the next mission starts and WHICH (through the chooser); the mission itself is
 /// <see cref="MissionRun"/>'s. Between two missions it waits a while that is not the same every time - the
 /// regularity a flat pace has is what this plugin exists to avoid - and now and then longer.
-/// It ends when the mode's goal is reached, when nothing wanted is on offer (no re-rolling), at a limit the
-/// user set, when a mission's run halts or is refused (worn gear, Hephaestus busy), or when it is stopped.
+/// It ends when the mode's goal is reached, when nothing wanted is on offer, at a limit the user set, when a
+/// mission's run halts or is refused (worn gear, Hephaestus busy), or when it is stopped.
+/// RE-ROLLING (2026-11-14, "Gold all" only, a tick): when the chooser names a mission to turn the board over
+/// with, it is accepted and abandoned (<see cref="Discard"/>) or, in the mix, run in an abandon's place - at
+/// most <see cref="MaxRerolls"/> turns in a row, then the chain stops and says so.
 /// Pure: the run's phase and the clock in, at most "start this mission" out.
 /// </summary>
 public sealed class MissionChain
@@ -193,9 +248,31 @@ public sealed class MissionChain
     public static readonly (int Min, int Max) LongPause = (20, 60);
     public const double LongPauseChance = 1.0 / 8.0;
 
+    /// <summary>
+    /// Re-rolls in a row before the chain gives up (Selene's own figure, not asked): each is a turn of the
+    /// board that brought nothing wanted - a mission abandoned, or one run in an abandon's place.
+    /// </summary>
+    public const int MaxRerolls = 8;
+
+    /// <summary>
+    /// The mix (the user, 2026-11-14: "Mix of both"): a re-roll is an abandon, but about one time in four -
+    /// and always after <see cref="MaxAbandonsInRow"/> abandons on end - the spare mission is RUN to its
+    /// report instead, so the board is never turned over by a long string of accept-and-abandon.
+    /// </summary>
+    public const double RunInsteadChance = 1.0 / 4.0;
+    public const int MaxAbandonsInRow = 3;
+
+    /// <summary>
+    /// Seconds between two looks while waiting for a mission that comes with the hours or the weather (ICE
+    /// re-reads the board every 15 s, on the dot; this is not on the dot).
+    /// </summary>
+    public static readonly (int Min, int Max) WaitLook = (20, 50);
+
     private DateTime _nextAt;
     private bool _ran;
     private bool _stopAfter;
+    private bool _discarding;
+    private int _abandonsInRow;
 
     public bool Active { get; private set; }
 
@@ -207,6 +284,18 @@ public sealed class MissionChain
     /// <summary>Stop after this many missions; 0 = no limit.</summary>
     public int Limit { get; private set; }
 
+    /// <summary>Missions abandoned since the chain began, to turn the board over.</summary>
+    public int Abandoned { get; private set; }
+
+    /// <summary>Turns of the board in a row that brought nothing wanted.</summary>
+    public int RerollsInRow { get; private set; }
+
+    /// <summary>The chain is on but idle: what is left comes with the hours or the weather, and it looks again now and then.</summary>
+    public bool Waiting { get; private set; }
+
+    /// <summary>The mission <see cref="Tick"/> last handed out is to be accepted and abandoned, not run.</summary>
+    public bool Discard => _discarding;
+
     public string Status { get; private set; } = "Idle — no chain started.";
 
     public void Start(ChainMode mode, int limit, DateTime now)
@@ -215,6 +304,11 @@ public sealed class MissionChain
         Mode = mode;
         Limit = Math.Max(0, limit);
         Completed = 0;
+        Abandoned = 0;
+        RerollsInRow = 0;
+        Waiting = false;
+        _abandonsInRow = 0;
+        _discarding = false;
         _ran = false;
         _stopAfter = false;
         _nextAt = now;
@@ -242,7 +336,12 @@ public sealed class MissionChain
     /// <param name="runStatus">What the run says of itself.</param>
     /// <param name="choose">The next mission for the mode; asked only when one is due.</param>
     /// <returns>The mission to start now; 0 = none.</returns>
-    public uint Tick(RunPhase run, string runStatus, Func<Choice> choose, DateTime now, ulong seed)
+    /// <param name="hold">
+    /// Asked when a mission is due, before one is chosen: a reason to wait (the repair between missions,
+    /// 2026-11-15 - "selene goes and repairs prior to starting another missin"), or null to go on. It may
+    /// stop the chain itself.
+    /// </param>
+    public uint Tick(RunPhase run, string runStatus, Func<Choice> choose, DateTime now, ulong seed, Func<string?>? hold = null)
     {
         if (!Active)
             return 0;
@@ -251,7 +350,9 @@ public sealed class MissionChain
         if (running)
         {
             _ran = true;
-            Status = $"Mission {Completed + 1}{(Limit > 0 ? $" of {Limit}" : string.Empty)}: {runStatus}{(_stopAfter ? " (stopping after it)" : string.Empty)}";
+            Status = _discarding
+                ? $"Re-roll {RerollsInRow} of {MaxRerolls} at most: {runStatus}{(_stopAfter ? " (stopping after it)" : string.Empty)}"
+                : $"Mission {Completed + 1}{(Limit > 0 ? $" of {Limit}" : string.Empty)}: {runStatus}{(_stopAfter ? " (stopping after it)" : string.Empty)}";
             return 0;
         }
 
@@ -265,7 +366,18 @@ public sealed class MissionChain
                 return 0;
             }
 
-            Completed++;
+            // [SUPERSEDED 2026-11-14 — a mission abandoned for a re-roll is not one reported]
+            // Completed++;
+            if (_discarding)
+            {
+                _discarding = false;
+                Abandoned++;
+            }
+            else
+            {
+                Completed++;
+            }
+
             if (Limit > 0 && Completed >= Limit)
             {
                 Stop("Done — the number of missions asked for.");
@@ -289,21 +401,88 @@ public sealed class MissionChain
 
         if (now < _nextAt)
         {
-            Status = $"{Completed} done — the next mission in {Math.Max(1, (int)(_nextAt - now).TotalSeconds)} s";
+            // While waiting for the hours or the weather the line says what for; the countdown is for the pause between missions.
+            if (!Waiting)
+                Status = $"{Completed} done — the next mission in {Math.Max(1, (int)(_nextAt - now).TotalSeconds)} s";
+            return 0;
+        }
+
+        // Something to do first (worn gear: the mender), or a reason to end here.
+        var waitingFor = hold?.Invoke();
+        if (!Active)
+            return 0;
+        if (waitingFor != null)
+        {
+            Status = $"{Completed} done — {waitingFor}";
             return 0;
         }
 
         var choice = choose();
+        if (choice.MissionId == 0 && choice.Wait)
+        {
+            // Nothing now, something later: stay on and look again in a while that is not the same every time.
+            if (_stopAfter)
+            {
+                Stop("Stopped while waiting, as asked.");
+                return 0;
+            }
+
+            var look = new SeededRandom(seed, unchecked((int)(now.Ticks / TimeSpan.TicksPerSecond)) ^ 0x57414954);
+            _nextAt = now + TimeSpan.FromSeconds(WaitLook.Min + (int)(look.NextDouble() * (WaitLook.Max - WaitLook.Min + 1)));
+            Waiting = true;
+            Status = $"{Completed} done — {choice.Why}";
+            return 0;
+        }
+
+        Waiting = false;
         if (choice.MissionId == 0)
         {
             Stop(choice.Finished ? $"Done — {choice.Why}." : $"Stopped — {choice.Why}.");
             return 0;
         }
 
+        if (choice.Reroll)
+        {
+            // Nothing wanted is on offer: the board is turned over - but not for ever.
+            if (RerollsInRow >= MaxRerolls)
+            {
+                Stop($"Stopped — the board was turned over {MaxRerolls} times in a row and nothing wanted came up ({choice.Why}).");
+                return 0;
+            }
+
+            RerollsInRow++;
+
+            // The mix: mostly an abandon; now and then, and always after a few abandons on end, the spare mission is run.
+            var mix = new SeededRandom(seed, unchecked((int)(now.Ticks / TimeSpan.TicksPerSecond)) ^ 0x5EED);
+            var runInstead = choice.CanRun && (_abandonsInRow >= MaxAbandonsInRow || mix.NextDouble() < RunInsteadChance);
+            if (runInstead)
+            {
+                _abandonsInRow = 0;
+                _discarding = false;
+                Status = $"Re-roll {RerollsInRow} of {MaxRerolls} at most: running {choice.MissionId} in an abandon's place — {choice.Why}";
+            }
+            else
+            {
+                _abandonsInRow++;
+                _discarding = true;
+                Status = $"Re-roll {RerollsInRow} of {MaxRerolls} at most: accepting {choice.MissionId} to abandon it — {choice.Why}";
+            }
+
+            _ran = true;
+            return choice.MissionId;
+        }
+
+        RerollsInRow = 0;
+        _abandonsInRow = 0;
+        _discarding = false;
         Status = $"Mission {Completed + 1}: taking {choice.MissionId} — {choice.Why}";
         _ran = true; // if the run refuses it, the caller stops the chain
         return choice.MissionId;
     }
 
-    private string Summary => Completed == 1 ? "(1 mission reported)" : $"({Completed} missions reported)";
+    // [SUPERSEDED 2026-11-14 — the abandoned ones are counted too]
+    // private string Summary => Completed == 1 ? "(1 mission reported)" : $"({Completed} missions reported)";
+    private string Summary
+        => (Completed == 1 ? "(1 mission reported" : $"({Completed} missions reported")
+           + (Abandoned > 0 ? $", {Abandoned} abandoned to turn the board over)" : ")");
 }

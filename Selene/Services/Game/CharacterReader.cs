@@ -45,6 +45,27 @@ public sealed unsafe class CharacterReader
     /// <summary>Which way the character faces (the game's rotation); 0 while there is no character.</summary>
     public float Rotation => _objectTable.LocalPlayer?.Rotation ?? 0f;
 
+    /// <summary>The zone the character is in, any zone (the mission reader only knows the Cosmic ones); 0 when the game will not say.</summary>
+    public uint TerritoryId
+    {
+        get
+        {
+            try
+            {
+                var game = FFXIVClientStructs.FFXIV.Client.Game.GameMain.Instance();
+                return game == null ? 0 : game->CurrentTerritoryTypeId;
+            }
+            catch
+            {
+                return 0;
+            }
+        }
+    }
+
+    /// <summary>The character is on its Home World; false while there is no character in the world.</summary>
+    public bool OnHomeWorld
+        => _objectTable.LocalPlayer is { } player && player.HomeWorld.RowId != 0 && player.HomeWorld.RowId == player.CurrentWorld.RowId;
+
     /// <summary>
     /// Turn the character to a rotation, as Demeter turns it to the water (<c>GameObject.SetRotation</c>).
     /// Whether it turned is read back from <see cref="Rotation"/>. Only the walk test calls this.
